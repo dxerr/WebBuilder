@@ -58,7 +58,7 @@ let isCancelling = false;
 let isPreparingBuild = false;
 let lastErrorLine = '';
 
-// 類ㅼ뮅 戮곗굚 怨몄쓧 リ턁筌앸렇Running Failed筌먲퐘遊?
+// 서버 비정상 종료 대처: 과거 Running 상태들을 Failed로 일괄 전환
 db.prepare(`UPDATE builds SET status = 'Failed', end_time = CURRENT_TIMESTAMP
             WHERE status = 'Running'`).run();
 
@@ -67,11 +67,32 @@ isPreparingBuild   = false;
 activeBuildProcess = null;
 isCancelling       = false;
 
+// isPreparingBuild watchdog: 5분 이상 Preparing 상태면 자동 리셋
+let preparingBuildSince = null;
+const _origPost = (v) => v;
+setInterval(() => {
+  if (isPreparingBuild && preparingBuildSince) {
+    const elapsed = Date.now() - preparingBuildSince;
+    if (elapsed > 5 * 60 * 1000) {
+      console.warn('[Watchdog] isPreparingBuild stuck >5min, auto-resetting.');
+      isPreparingBuild   = false;
+      activeBuildProcess = null;
+      isCancelling       = false;
+      pendingBuildContext = null;
+      preparingBuildSince = null;
+      broadcast({ type: 'BUILD_LOCK_RESET', message: 'Build lock auto-reset by watchdog' });
+    }
+  } else if (!isPreparingBuild) {
+    preparingBuildSince = null;
+  }
+}, 30 * 1000);
+
 // GET /api/git/refs
 app.get('/api/git/refs', async (req, res) => {
   const repoPath = req.query.path || 'F:\\wz\\UE_CICD\\SampleProject';
   try {
-    // ?熬곣뫗HEAD 戮ャ럦?    let currentBranch = '';
+    // 현재 활성화된 HEAD 브랜치 획득
+    let currentBranch = '';
     try {
       const { stdout: headOut } = await execAsync(`git -C "${repoPath}" rev-parse --abbrev-ref HEAD`);
       currentBranch = headOut.trim();
@@ -103,7 +124,7 @@ app.get('/api/git/refs', async (req, res) => {
       );
       const localNames = new Set(localBranches.map(b => b.name));
       remoteBranches = remoteOut.split('\n').filter(Boolean)
-        .filter(line => !line.includes('HEAD') && line.includes('/'))  // HEAD ⑸츎 戮곕뇶
+        .filter(line => !line.includes('HEAD') && line.includes('/'))  // HEAD 포인터 명시적 스킵
         .map(line => {
           const parts = line.split('|');
           const fullName  = parts[0] || '';             // e.g. origin/RunnerV2
@@ -120,12 +141,12 @@ app.get('/api/git/refs', async (req, res) => {
             isCurrent: false
           };
         })
-        .filter(b => !localNames.has(b.name));          // ?β돦裕뉛쭚濾?繞벿살탮戮곕뇶
+        .filter(b => !localNames.has(b.name));          // 로컬 브랜치명과 중복되는 원격 브랜치는 통합 처리
     } catch (_) {}
 
     const branches = [...localBranches, ...remoteBranches];
 
-    // 蹂μ쟽 嶺뚮ㅄ維뽨빳?
+    // 태그(Tag) 정보 최신순으로 획득
     let tags = [];
     try {
       const { stdout: tagOut } = await execAsync(
@@ -248,10 +269,11 @@ async function executeBuild(ctx) {
       const isRemoteOnly = !isLocalBranch && remoteList.trim().length > 0;
       if (isRemoteOnly) {
         await execAsync(`git -C "${finalProjectPath}" checkout -B "${gitRevision}" --track "origin/${gitRevision}"`);
-        broadcast({ type: 'LOG', data: `[Git] 洹먮맓嫄β돦裕뉛쭚筌뤾퍔戮ャ럦諛댁뎽 checkout: ${gitRevision}` });
+        broadcast({ type: 'LOG', data: `[Git] 리모트 전용 브랜치 로컬 트래킹 checkout: ${gitRevision}` });
       } else {
         await execAsync(`git -C "${finalProjectPath}" checkout ${gitRevision}`);
-        broadcast({ type: 'LOG', data: `[Git] checkout ?熬곣뫁});
+        broadcast({ type: 'LOG', data: `[Git] checkout 완료` });
+
       }
       if (isCancelling) throw new Error('Canceled during git checkout');
 
@@ -259,18 +281,18 @@ async function executeBuild(ctx) {
       const isBranch = await isBranchName(finalProjectPath, gitRevision);
       if (isBranch) {
         broadcast({ type: 'STEP', ...BUILD_STEPS.GIT_PULL, buildId });
-        broadcast({ type: 'LOG',  data: `[Git] Step 4/5 pull (branch: ${finalBranch})` });
+        broadcast({ type: 'LOG',  data: `[Git] Step 4/5 pull (branch: ${gitRevision})` });
         await execAsync(`git -C "${finalProjectPath}" pull`);
-        broadcast({ type: 'LOG',  data: `[Git] pull ?熬곣뫁});
+        broadcast({ type: 'LOG',  data: `[Git] pull done` });
         if (isCancelling) throw new Error('Canceled during git pull');
       } else {
-        broadcast({ type: 'LOG', data: `[Git] Step 4/5 pull (detached HEAD / tag)` });
+        broadcast({ type: 'LOG', data: `[Git] Step 4/5 pull skip (detached HEAD / tag)` });
       }
 
     } else {
       // HEAD mode: no checkout, but still fetch+pull current branch for latest commits
       broadcast({ type: 'STEP', ...BUILD_STEPS.GIT_SWITCH, buildId });
-      broadcast({ type: 'LOG',  data: `[Git] Step 3/5 HEAD (checkout )` });
+      broadcast({ type: 'LOG',  data: `[Git] Step 3/5 HEAD (checkout 생략, 현재 브랜치 연결 유지)` });
 
       let currentBranch = '';
       try {
@@ -280,12 +302,12 @@ async function executeBuild(ctx) {
 
       if (currentBranch && currentBranch !== 'HEAD') {
         broadcast({ type: 'STEP', ...BUILD_STEPS.GIT_PULL, buildId });
-        broadcast({ type: 'LOG',  data: `[Git] Step 4/5 pull (branch: ${finalBranch})` });
+        broadcast({ type: 'LOG',  data: `[Git] Step 4/5 pull (branch: ${currentBranch})` });
         await execAsync(`git -C "${finalProjectPath}" pull`);
-        broadcast({ type: 'LOG',  data: `[Git] pull ?熬곣뫁});
+        broadcast({ type: 'LOG',  data: `[Git] pull done` });
         if (isCancelling) throw new Error('Canceled during git pull');
       } else {
-        broadcast({ type: 'LOG', data: `[Git] Step 4/5 pull (detached HEAD ⑤객臾?` });
+        broadcast({ type: 'LOG', data: `[Git] Step 4/5 pull skip (detached HEAD)` });
       }
     }
 
@@ -296,14 +318,15 @@ async function executeBuild(ctx) {
       broadcast({ type: 'LOG',      data: `[Git] Latest commit HEAD: ${headSha.trim()} "${headMsg.trim()}""` });
       broadcast({ type: 'GIT_DONE', buildId });
     }
-    // PHASE 2: キbroadcast({ type: 'STEP', ...BUILD_STEPS.BUILD_START, buildId });
+    // PHASE 2: 빌드 명령줄 조립 및 서브프로세스 런처 진입
+    broadcast({ type: 'STEP', ...BUILD_STEPS.BUILD_START, buildId });
     broadcast({ type: 'LOG',  data: `[Build] Step 5/5 BAT run (${platform} / ${config})` });
 
     const batEnv        = {
       ...process.env,
       ENGINE_DIR_OVERRIDE:  finalEnginePath,
       PROJECT_DIR_OVERRIDE: finalProjectPath,
-      // Android SDK User 六熬곣뫁夷?筌뤾쑬裕亦껋꼶梨fallback
+      // Android SDK 등 시스템 환경 변수가 설정되지 않은 경우를 대비한 하드코딩 Fallback 경로
       ANDROID_HOME:         process.env.ANDROID_HOME     || 'C:\\Android\\Sdk',
       ANDROID_SDK_ROOT:     process.env.ANDROID_SDK_ROOT || 'C:\\Android\\Sdk',
       NDKROOT:              process.env.NDKROOT          || 'C:\\Android\\Sdk\\ndk\\27.2.12479018',
@@ -319,14 +342,14 @@ async function executeBuild(ctx) {
     isPreparingBuild = false;
 
     activeBuildProcess.stdout.on('data', (d) => {
-      const txt = iconv.decode(d, 'cp949');
+      const txt = d.toString('utf8');
       broadcast({ type: 'LOG', data: txt });
       const lines = txt.trim().split('\n').filter(Boolean);
       const errLine = lines.find(l => /error|failed|exception/i.test(l) && !/^using |^running |^log file|^total/i.test(l));
       if (errLine) lastErrorLine = errLine.trim();
     });
     activeBuildProcess.stderr.on('data', (d) => {
-      const txt = iconv.decode(d, 'cp949');
+      const txt = d.toString('utf8');
       broadcast({ type: 'LOG_ERROR', data: txt });
       const lines = txt.trim().split('\n').filter(Boolean);
       if (lines.length > 0) lastErrorLine = lines[lines.length - 1].trim();
@@ -338,7 +361,8 @@ async function executeBuild(ctx) {
       let   status          = code === 0 ? 'Success' : 'Failed';
       if (isCancelling) status = 'Canceled';
 
-      // ?熬곣뫖異δ빳ｌ뫒亦?(?繹먭퍓沅let archivePath = null;
+      // 결과 패키지가 저장된 아카이브 절대 경로 문자열 파싱 (UI 탐색기 연동)
+      let archivePath = null;
       if (status === 'Success') {
         const pathLib = require('path');
         const base = finalProjectPath || pathLib.dirname(BAT_SCRIPT_PATH);
@@ -394,6 +418,7 @@ app.post('/api/build', (req, res) => {
   activeBuildId          = buildId;
   isCancelling           = false;
   isPreparingBuild       = true;
+  preparingBuildSince    = Date.now();
   pendingBuildContext    = null;
 
   db.prepare('INSERT INTO builds (id, platform, config, status, start_time) VALUES (?, ?, ?, ?, ?)')
@@ -406,16 +431,18 @@ app.post('/api/build', (req, res) => {
       const finalProjectPath = projectPath || 'F:\\wz\\UE_CICD\\SampleProject';
       const ctx = { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision };
 
-      // STEP 1/5: ?β돦裕뉛쭚⒵쾮嶺뚳퐢?얍칰broadcast({ type: 'STEP', ...BUILD_STEPS.GIT_CHECK, buildId });
+      // STEP 1/5: 로컬 변경사항 존재 여부 확인 (충돌 방지)
+      broadcast({ type: 'STEP', ...BUILD_STEPS.GIT_CHECK, buildId });
       broadcast({ type: 'LOG',  data: `[Git] Step 1/5 local changes check` });
 
       const { stdout: statusOut } = await execAsync(`git -C "${finalProjectPath}" status --porcelain`);
       const changedFiles = statusOut.trim().split('\n').filter(Boolean)
         .map(l => l.trim())
-        .filter(l => !l.startsWith('')); // untracked 逾戮곕뇶 (?怨뺣뾼⒵쾮壤?
+        .filter(l => !l.startsWith('?')); // untracked 파일(?)은 Git 버전에 영향을 받지 않으므로 경고하지 않음
 
       if (changedFiles.length > 0) {
-        // ?곌떠⒵쾮熬곣뫁夷?筌뤾쑬筌먦끉逾broadcast({ type: 'LOG', data: `[Git] ο쭕逾?${changedFiles.length}` });
+        // 파일이 감지되었다면 리스트업 수행 후 UI 측으로 CONFIRM 트리거 발송
+        broadcast({ type: 'LOG', data: `[Git] 충돌 유발 가능한 파일 개수: ${changedFiles.length}개 발견` });
         changedFiles.forEach(f => broadcast({ type: 'LOG', data: `       ${f}` }));
 
         pendingBuildContext = ctx;
@@ -423,12 +450,14 @@ app.post('/api/build', (req, res) => {
           type: 'CONFIRM_REVERT',
           buildId,
           files: changedFiles,
-          message: `?β돦裕뉛쭚⒵쾮${changedFiles.length}?띠룇裕? . Revert キ?꾨ご?嶺뚯쉳?듸쭛琉용뻣?롪퍔伊`
+          message: `로컬 변경사항이 ${changedFiles.length}개 존재합니다. 모두 Revert 처리 후 빌드를 진행하시겠습니까?`
         });
-        // 袁⑸쐩 /api/build/confirm 裕?/api/build/cancel return;
+        // UI의 사용자 결정(confirm 또는 cancel API 호출) 대기상태가 되므로 여기서 흐름 명시적 종료
+        return;
       }
 
-      broadcast({ type: 'LOG', data: `[Git] ⒵쾮怨몃쾳 餓?嶺뚯쉳?듸쭛? });
+      broadcast({ type: 'LOG', data: `[Git] 로컬 환경 클린 상태. 충돌 없음` });
+
       await executeBuild(ctx);
 
     } catch (err) {
@@ -445,7 +474,7 @@ app.post('/api/build', (req, res) => {
   })();
 });
 
-// POST /api/build/confirm Revert ?筌먦끉逾キ
+// POST /api/build/confirm : 변경사항 강제 Revert 허용 및 빌드 파이프라인 재개
 app.post('/api/build/confirm', async (req, res) => {
   if (!pendingBuildContext) {
     return res.status(400).json({ error: 'No pending build to confirm' });
@@ -457,7 +486,7 @@ app.post('/api/build/confirm', async (req, res) => {
   try {
     broadcast({ type: 'LOG', data: '[Git] Revert 餓?.. 筌뤴뫀諭?嚥≪뮇類?癰궰野껋럩沅' });
     await execAsync(`git -C "${ctx.finalProjectPath}" checkout -- .`);
-    broadcast({ type: 'LOG', data: '[Git] Revert ?袁⑥┷. 諭띄몴' });
+    broadcast({ type: 'LOG', data: '[Git] Revert 완료. 기존 빌드 프로세스 지속' });
     await executeBuild(ctx);
   } catch (err) {
     isPreparingBuild    = false;
@@ -486,14 +515,14 @@ app.post('/api/build/cancel', (req, res) => {
   res.json({ message: 'Cancellation requested' });
 });
 
-// POST /api/build/reset 踰貫?껆뵳(
+// POST /api/build/reset : 교착상태(Lock) 대피용 빌드 상태 강제 릴리즈 처리 기능
 app.post('/api/build/reset', (req, res) => {
   const wasLocked = isPreparingBuild || !!activeBuildProcess;
   isPreparingBuild   = false;
   activeBuildProcess = null;
   activeBuildId      = null;
   isCancelling       = false;
-  // DB Running 類ｌ┣ ?筌먲퐘遊?
+  // DB 메모리상 남아있는 Running 상태 프로세스들을 일괄 Failed로 덤프 처리
   db.prepare(`UPDATE builds SET status = 'Failed', end_time = CURRENT_TIMESTAMP
               WHERE status = 'Running'`).run();
   res.json({ message: 'Build state reset', wasLocked });
