@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Play, Activity, History, Terminal as TerminalIcon, XCircle, GitBranch, GitCommit, Tag, RefreshCw, ChevronDown, Check, FolderOpen, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { Play, Activity, History, Terminal as TerminalIcon, XCircle, GitBranch, GitCommit, Tag, RefreshCw, ChevronDown, Check, FolderOpen, AlertTriangle, CheckCircle2, Trash2, Sparkles } from 'lucide-react';
 import { format } from 'date-fns';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -366,6 +366,9 @@ export default function App() {
   const [gitRepoPath, setGitRepoPath] = useState('F:\\wz\\UE_CICD\\SampleProject');
   const [gitRevision, setGitRevision] = useState('');
 
+  const [cleanBuild, setCleanBuild]   = useState(false);
+  const [clearCache, setClearCache]     = useState(false);
+  const [clearCacheConfirm, setClearCacheConfirm] = useState(false);
   const [isBuilding, setIsBuilding]   = useState(false);
   const [buildStatus, setBuildStatus] = useState('Idle');
   const [buildStep, setBuildStep]     = useState<{ step: number; total: number; label: string } | null>(null);
@@ -374,6 +377,7 @@ export default function App() {
   const [history, setHistory]         = useState<any[]>([]);
   const [analytics, setAnalytics]     = useState<any>(null);
   const [revertConfirm, setRevertConfirm] = useState<{ buildId: string; files: string[] } | null>(null);
+  const [isBuildLocked, setIsBuildLocked] = useState(false);
 
   const terminalRef = useRef<HTMLDivElement>(null);
 
@@ -381,6 +385,12 @@ export default function App() {
     const ws = new WebSocket(WS_URL);
     ws.onmessage = (event) => {
       const message = JSON.parse(event.data);
+      if (message.type === 'BUILD_LOCK_RESET') {
+        setIsBuildLocked(false);
+        setIsBuilding(false);
+        setBuildStatus('Lock auto-reset by server');
+        return;
+      }
       if (message.type === 'LOG' || message.type === 'LOG_ERROR') {
         const text = message.data.trim();
         if (text) {
@@ -424,9 +434,18 @@ export default function App() {
   const fetchHistory   = async () => { try { const r = await fetch(`${API_URL}/history`);  setHistory(await r.json());  } catch(e){} };
   const fetchAnalytics = async () => { try { const r = await fetch(`${API_URL}/analytics`); setAnalytics(await r.json()); } catch(e){} };
 
-  const handleBuild = async () => {
+  const handleBuild = () => {
+    if (clearCache) {
+      setClearCacheConfirm(true);
+      return;
+    }
+    proceedBuild();
+  };
+
+  const proceedBuild = async () => {
+
     setIsBuilding(true);
-    setBuildResult(null);   // 이전 결과 초기화
+    setBuildResult(null);
     setLogs([]);
     setBuildStep(null);
     setRevertConfirm(null);
@@ -435,13 +454,30 @@ export default function App() {
       const res = await fetch(`${API_URL}/build`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ platform, config, enginePath, projectPath, gitRevision })
+        body: JSON.stringify({ platform, config, enginePath, projectPath, gitRevision, cleanBuild, clearCache })
       });
+      if (res.status === 400) {
+        const body = await res.json().catch(() => ({}));
+        if (body.error?.includes('already in progress')) {
+          setIsBuildLocked(true);
+          setBuildStatus('Build Locked');
+          setIsBuilding(false);
+          return;
+        }
+      }
       if (!res.ok) throw new Error('Failed to start build');
     } catch {
       setBuildStatus('Failed to start');
       setIsBuilding(false);
     }
+  };
+
+  const handleResetLock = async () => {
+    try {
+      await fetch(`${API_URL}/build/reset`, { method: 'POST' });
+      setIsBuildLocked(false);
+      setBuildStatus('Idle');
+    } catch {}
   };
 
   const handleCancelBuild = async () => {
@@ -503,6 +539,50 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* ── Clear Cache 확인 모달 ── */}
+      <AnimatePresence>
+        {clearCacheConfirm && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }}
+              style={{ background: 'var(--panel-bg)', border: '1px solid rgba(239,68,68,0.4)', borderRadius: '1rem', padding: '2rem', maxWidth: '480px', width: '90%', boxShadow: '0 0 40px rgba(239,68,68,0.15)' }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1rem' }}>
+                <Trash2 size={22} color="#ef4444"/>
+                <span style={{ fontWeight: 700, fontSize: '1.05rem' }}>Clear Cache Warning</span>
+              </div>
+              <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', marginBottom: '1rem', lineHeight: 1.6 }}>
+                The following folders will be <strong style={{ color: '#ef4444' }}>permanently deleted</strong> from the project directory:
+              </p>
+              <div style={{ background: 'rgba(0,0,0,0.3)', borderRadius: '0.5rem', padding: '0.75rem 1rem', marginBottom: '0.75rem' }}>
+                {['Intermediate/', 'Saved/', 'Binaries/', 'XmlConfigCache.bin'].map((f, i) => (
+                  <div key={i} style={{ fontFamily: 'monospace', fontSize: '0.8rem', color: '#fca5a5', padding: '0.15rem 0', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                    <Trash2 size={11} style={{ opacity: 0.6 }}/> {f}
+                  </div>
+                ))}
+              </div>
+              <p style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', marginBottom: '1.5rem', lineHeight: 1.5, background: 'rgba(239,68,68,0.08)', padding: '0.6rem 0.8rem', borderRadius: '0.4rem', border: '1px solid rgba(239,68,68,0.15)' }}>
+                This will force a full rebuild from scratch. Build time will significantly increase.
+              </p>
+              <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end' }}>
+                <button className="btn-secondary" onClick={() => setClearCacheConfirm(false)} style={{ padding: '0.6rem 1.2rem' }}>
+                  Cancel
+                </button>
+                <button
+                  onClick={() => { setClearCacheConfirm(false); proceedBuild(); }}
+                  style={{ padding: '0.6rem 1.2rem', background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.4)', color: '#ef4444', borderRadius: '0.5rem', cursor: 'pointer', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '0.4rem' }}
+                >
+                  <Trash2 size={14}/> Confirm & Build
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* ── Sidebar ── */}
       <nav className="sidebar">
         <div className="header-title"><TerminalIcon size={28}/><span>ExFrameWork Portal</span></div>
@@ -531,6 +611,20 @@ export default function App() {
           </div>
           <div style={{ marginTop: '0.5rem', fontSize: '0.875rem', color: 'var(--text-secondary)' }}>{buildStatus}</div>
 
+          {/* 빌드 잠금 배너 */}
+          {isBuildLocked && (
+            <div style={{ marginTop: '1rem', padding: '0.75rem 1rem', background: 'rgba(234,179,8,0.12)', border: '1px solid rgba(234,179,8,0.4)', borderRadius: '0.5rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              <div style={{ color: '#facc15', fontWeight: 600, fontSize: '0.85rem' }}>⚠️ Build Lock Detected</div>
+              <div style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>이전 빌드가 비정상 종료되어 잠금이 걸려 있습니다.</div>
+              <button
+                onClick={handleResetLock}
+                style={{ marginTop: '0.25rem', padding: '0.4rem 0.9rem', background: 'rgba(234,179,8,0.2)', border: '1px solid rgba(234,179,8,0.5)', color: '#facc15', borderRadius: '0.4rem', cursor: 'pointer', fontWeight: 600, fontSize: '0.82rem', alignSelf: 'flex-start' }}
+              >
+                🔓 Reset Build Lock
+              </button>
+            </div>
+          )}
+
           {/* 단계별 스텝퍼 */}
           <AnimatePresence>
             {isBuilding && buildStep && (
@@ -553,30 +647,43 @@ export default function App() {
                     />
                   </div>
                 </div>
-                {[
-                  { step: 1, label: 'Git Check' },
-                  { step: 2, label: 'Git Fetch' },
-                  { step: 3, label: 'Git Checkout' },
-                  { step: 4, label: 'Git Pull' },
-                  { step: 5, label: 'Build' },
-                ].map(s => {
+                {(buildStep && buildStep.total === 6
+                  ? [
+                      { step: 1, label: 'Git Check' },
+                      { step: 2, label: 'Git Fetch' },
+                      { step: 3, label: 'Git Checkout' },
+                      { step: 4, label: 'Git Pull' },
+                      { step: 5, label: 'Clear Cache', isDanger: true },
+                      { step: 6, label: 'Build' },
+                    ]
+                  : [
+                      { step: 1, label: 'Git Check' },
+                      { step: 2, label: 'Git Fetch' },
+                      { step: 3, label: 'Git Checkout' },
+                      { step: 4, label: 'Git Pull' },
+                      { step: 5, label: 'Build' },
+                    ]
+                ).map(s => {
                   const done   = s.step < buildStep.step;
                   const active = s.step === buildStep.step;
+                  const danger = (s as any).isDanger;
+                  const activeColor = danger && active ? '#ef4444' : 'var(--primary-color)';
+                  const doneColor   = danger && done ? '#ef4444' : 'var(--success-color)';
                   return (
-                    <div key={s.step} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.2rem 0', fontSize: '0.78rem' }}>
-                      <div style={{
-                        width: '16px', height: '16px', borderRadius: '50%', flexShrink: 0,
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        background: done ? 'var(--success-color)' : active ? 'var(--primary-color)' : 'rgba(255,255,255,0.08)',
-                        fontSize: '0.6rem', fontWeight: 700,
-                        color: (done || active) ? '#0f172a' : 'var(--text-secondary)',
-                        boxShadow: active ? '0 0 8px rgba(56,189,248,0.6)' : 'none',
-                        transition: 'all 0.3s'
-                      }}>
-                        {done ? '✓' : s.step}
-                      </div>
-                      <span style={{ color: done ? 'var(--success-color)' : active ? 'var(--primary-color)' : 'var(--text-secondary)', fontWeight: active ? 600 : 400 }}>
-                        {s.label}
+                  <div key={s.step} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.2rem 0', fontSize: '0.78rem' }}>
+                  <div style={{
+                  width: '16px', height: '16px', borderRadius: '50%', flexShrink: 0,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  background: done ? doneColor : active ? activeColor : 'rgba(255,255,255,0.08)',
+                  fontSize: '0.6rem', fontWeight: 700,
+                    color: (done || active) ? '#0f172a' : 'var(--text-secondary)',
+                  boxShadow: active ? `0 0 8px ${danger ? 'rgba(239,68,68,0.6)' : 'rgba(56,189,248,0.6)'}` : 'none',
+                    transition: 'all 0.3s'
+                  }}>
+                  {done ? '✓' : s.step}
+                  </div>
+                  <span style={{ color: done ? doneColor : active ? activeColor : 'var(--text-secondary)', fontWeight: active ? 600 : 400 }}>
+                      {s.label}
                         {active && <motion.span animate={{ opacity: [1, 0.3, 1] }} transition={{ repeat: Infinity, duration: 1.2 }}>...</motion.span>}
                       </span>
                     </div>
@@ -654,7 +761,77 @@ export default function App() {
                 <input type="text" className="path-input" value={projectPath} onChange={e => setProjectPath(e.target.value)} placeholder="e.g. F:\wz\UE_CICD\SampleProject"/>
               </div>
 
-              <div style={{ marginTop: '1rem', display: 'flex', justifyContent: 'flex-end' }}>
+              {/* ── Build Options ── */}
+              <div style={{
+                marginTop: '1rem',
+                padding: '1rem 1.25rem',
+                borderRadius: '12px',
+                background: 'rgba(255,255,255,0.02)',
+                border: '1px solid rgba(255,255,255,0.06)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexWrap: 'wrap',
+                gap: '1rem',
+              }}>
+                <div style={{ display: 'flex', gap: '1.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                  {/* Clean Build Toggle */}
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', cursor: 'pointer', userSelect: 'none' }}>
+                    <div
+                      onClick={() => setCleanBuild(v => !v)}
+                      style={{
+                        width: '38px', height: '20px', borderRadius: '999px',
+                        background: cleanBuild ? 'var(--primary-color)' : 'rgba(255,255,255,0.1)',
+                        position: 'relative', transition: 'background 0.2s', cursor: 'pointer',
+                        border: `1px solid ${cleanBuild ? 'rgba(56,189,248,0.5)' : 'rgba(255,255,255,0.15)'}`,
+                      }}
+                    >
+                      <motion.div
+                        animate={{ x: cleanBuild ? 18 : 2 }}
+                        transition={{ type: 'spring', stiffness: 500, damping: 30 }}
+                        style={{
+                          width: '16px', height: '16px', borderRadius: '50%',
+                          background: cleanBuild ? '#fff' : 'rgba(255,255,255,0.4)',
+                          position: 'absolute', top: '1px',
+                          boxShadow: cleanBuild ? '0 0 6px rgba(56,189,248,0.5)' : 'none',
+                        }}
+                      />
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                      <Sparkles size={13} style={{ color: cleanBuild ? 'var(--primary-color)' : 'var(--text-secondary)' }}/>
+                      <span style={{ fontSize: '0.82rem', fontWeight: 500, color: cleanBuild ? 'var(--text-primary)' : 'var(--text-secondary)' }}>Clean Build</span>
+                    </div>
+                  </label>
+
+                  {/* Clear Cache Toggle */}
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', cursor: 'pointer', userSelect: 'none' }}>
+                    <div
+                      onClick={() => setClearCache(v => !v)}
+                      style={{
+                        width: '38px', height: '20px', borderRadius: '999px',
+                        background: clearCache ? '#ef4444' : 'rgba(255,255,255,0.1)',
+                        position: 'relative', transition: 'background 0.2s', cursor: 'pointer',
+                        border: `1px solid ${clearCache ? 'rgba(239,68,68,0.5)' : 'rgba(255,255,255,0.15)'}`,
+                      }}
+                    >
+                      <motion.div
+                        animate={{ x: clearCache ? 18 : 2 }}
+                        transition={{ type: 'spring', stiffness: 500, damping: 30 }}
+                        style={{
+                          width: '16px', height: '16px', borderRadius: '50%',
+                          background: clearCache ? '#fff' : 'rgba(255,255,255,0.4)',
+                          position: 'absolute', top: '1px',
+                          boxShadow: clearCache ? '0 0 6px rgba(239,68,68,0.5)' : 'none',
+                        }}
+                      />
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                      <Trash2 size={13} style={{ color: clearCache ? '#ef4444' : 'var(--text-secondary)' }}/>
+                      <span style={{ fontSize: '0.82rem', fontWeight: 500, color: clearCache ? '#ef4444' : 'var(--text-secondary)' }}>Clear Cache</span>
+                    </div>
+                  </label>
+                </div>
+
                 {!isBuilding ? (
                   <button className="glass-button launch" onClick={handleBuild}><TerminalIcon size={20}/> Launch Editor Build</button>
                 ) : (

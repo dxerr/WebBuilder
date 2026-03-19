@@ -225,13 +225,27 @@ app.get('/api/git/commits', async (req, res) => {
 });
 
 // キ節띉⑤챶
-const BUILD_STEPS = {
-  GIT_CHECK:   { step: 1, total: 5, label: 'Git Check'    },
-  GIT_FETCH:   { step: 2, total: 5, label: 'Git Fetch'    },
-  GIT_SWITCH:  { step: 3, total: 5, label: 'Git Checkout' },
-  GIT_PULL:    { step: 4, total: 5, label: 'Git Pull'     },
-  BUILD_START: { step: 5, total: 5, label: 'Build'        },
-};
+// step total은 clearCache 여부에 따라 동적으로 결정 (5 or 6)
+function getBuildSteps(hasClearCache) {
+  const total = hasClearCache ? 6 : 5;
+  if (hasClearCache) {
+    return {
+      GIT_CHECK:    { step: 1, total, label: 'Git Check'    },
+      GIT_FETCH:    { step: 2, total, label: 'Git Fetch'    },
+      GIT_SWITCH:   { step: 3, total, label: 'Git Checkout' },
+      GIT_PULL:     { step: 4, total, label: 'Git Pull'     },
+      CLEAR_CACHE:  { step: 5, total, label: 'Clear Cache'  },
+      BUILD_START:  { step: 6, total, label: 'Build'        },
+    };
+  }
+  return {
+    GIT_CHECK:   { step: 1, total, label: 'Git Check'    },
+    GIT_FETCH:   { step: 2, total, label: 'Git Fetch'    },
+    GIT_SWITCH:  { step: 3, total, label: 'Git Checkout' },
+    GIT_PULL:    { step: 4, total, label: 'Git Pull'     },
+    BUILD_START: { step: 5, total, label: 'Build'        },
+  };
+}
 
 // gitRevision 戮ャ럦?濡?뎄?筌? (?β돦裕뉛쭚?+ ?洹먮맓嫄嶺뚮ㅄ維筌筌먦끉逾?
 async function isBranchName(repoPath, revision) {
@@ -248,21 +262,22 @@ let pendingBuildContext = null;
 
 // 堉キ貫
 async function executeBuild(ctx) {
-  const { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision } = ctx;
+  const { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision, cleanBuild, clearCache } = ctx;
+  const STEPS = getBuildSteps(clearCache);
   try {
     // -- PHASE 1: Git sync (always runs) ------------------------------------------
 
-    // STEP 2/5 - git fetch --all
-    broadcast({ type: 'STEP', ...BUILD_STEPS.GIT_FETCH, buildId });
-    broadcast({ type: 'LOG',  data: `[Git] Step 2/5 fetch --all` });
+    // git fetch --all
+    broadcast({ type: 'STEP', ...STEPS.GIT_FETCH, buildId });
+    broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_FETCH.step}/${STEPS.GIT_FETCH.total} fetch --all` });
     await execAsync(`git -C "${finalProjectPath}" fetch --all`);
     broadcast({ type: 'LOG',  data: `[Git] fetch complete`});
     if (isCancelling) throw new Error('Canceled during git fetch');
 
     if (gitRevision) {
       // STEP 3/5 - checkout specified revision
-      broadcast({ type: 'STEP', ...BUILD_STEPS.GIT_SWITCH, buildId });
-      broadcast({ type: 'LOG',  data: `[Git] Step 3/5 checkout: ${gitRevision}` });
+      broadcast({ type: 'STEP', ...STEPS.GIT_SWITCH, buildId });
+      broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_SWITCH.step}/${STEPS.GIT_SWITCH.total} checkout: ${gitRevision}` });
       const { stdout: localList } = await execAsync(`git -C "${finalProjectPath}" branch --list "${gitRevision}"`);
       const isLocalBranch = localList.trim().length > 0;
       const { stdout: remoteList } = await execAsync(`git -C "${finalProjectPath}" branch -r --list "origin/${gitRevision}"`);
@@ -280,8 +295,8 @@ async function executeBuild(ctx) {
       // STEP 4/5 - pull if branch
       const isBranch = await isBranchName(finalProjectPath, gitRevision);
       if (isBranch) {
-        broadcast({ type: 'STEP', ...BUILD_STEPS.GIT_PULL, buildId });
-        broadcast({ type: 'LOG',  data: `[Git] Step 4/5 pull (branch: ${gitRevision})` });
+        broadcast({ type: 'STEP', ...STEPS.GIT_PULL, buildId });
+        broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_PULL.step}/${STEPS.GIT_PULL.total} pull (branch: ${gitRevision})` });
         await execAsync(`git -C "${finalProjectPath}" pull`);
         broadcast({ type: 'LOG',  data: `[Git] pull done` });
         if (isCancelling) throw new Error('Canceled during git pull');
@@ -291,8 +306,8 @@ async function executeBuild(ctx) {
 
     } else {
       // HEAD mode: no checkout, but still fetch+pull current branch for latest commits
-      broadcast({ type: 'STEP', ...BUILD_STEPS.GIT_SWITCH, buildId });
-      broadcast({ type: 'LOG',  data: `[Git] Step 3/5 HEAD (checkout 생략, 현재 브랜치 연결 유지)` });
+      broadcast({ type: 'STEP', ...STEPS.GIT_SWITCH, buildId });
+      broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_SWITCH.step}/${STEPS.GIT_SWITCH.total} HEAD (checkout 생략, 현재 브랜치 연결 유지)` });
 
       let currentBranch = '';
       try {
@@ -301,8 +316,8 @@ async function executeBuild(ctx) {
       } catch (_) {}
 
       if (currentBranch && currentBranch !== 'HEAD') {
-        broadcast({ type: 'STEP', ...BUILD_STEPS.GIT_PULL, buildId });
-        broadcast({ type: 'LOG',  data: `[Git] Step 4/5 pull (branch: ${currentBranch})` });
+        broadcast({ type: 'STEP', ...STEPS.GIT_PULL, buildId });
+        broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_PULL.step}/${STEPS.GIT_PULL.total} pull (branch: ${currentBranch})` });
         await execAsync(`git -C "${finalProjectPath}" pull`);
         broadcast({ type: 'LOG',  data: `[Git] pull done` });
         if (isCancelling) throw new Error('Canceled during git pull');
@@ -318,9 +333,39 @@ async function executeBuild(ctx) {
       broadcast({ type: 'LOG',      data: `[Git] Latest commit HEAD: ${headSha.trim()} "${headMsg.trim()}""` });
       broadcast({ type: 'GIT_DONE', buildId });
     }
+    // -- PHASE 1.5: Clear Cache (optional) --
+    if (clearCache) {
+      broadcast({ type: 'STEP', ...STEPS.CLEAR_CACHE, buildId });
+      broadcast({ type: 'LOG', data: `[Clean] Step ${STEPS.CLEAR_CACHE.step}/${STEPS.CLEAR_CACHE.total} Clearing build cache and intermediate files...` });
+      broadcast({ type: 'LOG', data: `[Clean] Target: ${finalProjectPath}` });
+      const fs = require('fs');
+      const pathLib = require('path');
+      // XmlConfigCache.bin 삭제
+      const xmlCache = pathLib.join(finalProjectPath, 'Intermediate', 'Build', 'XmlConfigCache.bin');
+      if (fs.existsSync(xmlCache)) {
+        fs.unlinkSync(xmlCache);
+        broadcast({ type: 'LOG', data: `[Clean] Removed: XmlConfigCache.bin` });
+      }
+      // Intermediate, Saved, Binaries 폴더 삭제
+      const foldersToClean = ['Intermediate', 'Saved', 'Binaries'];
+      for (const folder of foldersToClean) {
+        const folderPath = pathLib.join(finalProjectPath, folder);
+        if (fs.existsSync(folderPath)) {
+          try {
+            fs.rmSync(folderPath, { recursive: true, force: true });
+            broadcast({ type: 'LOG', data: `[Clean] Removed: ${folder}/` });
+          } catch (e) {
+            broadcast({ type: 'LOG', data: `[Clean] Warning: Could not fully remove ${folder}/ - ${e.message}` });
+          }
+        }
+      }
+      broadcast({ type: 'LOG', data: `[Clean] Cache cleared successfully` });
+    }
+    if (isCancelling) throw new Error('Canceled during cache clear');
+
     // PHASE 2: 빌드 명령줄 조립 및 서브프로세스 런처 진입
-    broadcast({ type: 'STEP', ...BUILD_STEPS.BUILD_START, buildId });
-    broadcast({ type: 'LOG',  data: `[Build] Step 5/5 BAT run (${platform} / ${config})` });
+    broadcast({ type: 'STEP', ...STEPS.BUILD_START, buildId });
+    broadcast({ type: 'LOG',  data: `[Build] Step ${STEPS.BUILD_START.step}/${STEPS.BUILD_START.total} BAT run (${platform} / ${config})${cleanBuild ? ' [Clean Build]' : ''}` });
 
     const batEnv        = {
       ...process.env,
@@ -331,11 +376,15 @@ async function executeBuild(ctx) {
       ANDROID_SDK_ROOT:     process.env.ANDROID_SDK_ROOT || 'C:\\Android\\Sdk',
       NDKROOT:              process.env.NDKROOT          || 'C:\\Android\\Sdk\\ndk\\27.2.12479018',
       NDK_ROOT:             process.env.NDK_ROOT         || 'C:\\Android\\Sdk\\ndk\\27.2.12479018',
-      JAVA_HOME:            process.env.JAVA_HOME        || 'C:\\Android\\jdk-17-new',
+      JAVA_HOME:            'C:\\Android\\jdk-17-new',
+      _JAVA_OPTIONS:        '-Djava.net.preferIPv4Stack=true',
     };
     const actualBatPath = finalProjectPath ? path.join(finalProjectPath, 'BuildProject.bat') : BAT_SCRIPT_PATH;
 
-    activeBuildProcess = spawn('cmd.exe', ['/c', actualBatPath, platform, config], {
+    const batArgs = ['/c', actualBatPath, platform, config];
+    if (cleanBuild) batArgs.push('-clean');
+
+    activeBuildProcess = spawn('cmd.exe', batArgs, {
       cwd: finalProjectPath ? finalProjectPath : path.dirname(BAT_SCRIPT_PATH),
       env: batEnv
     });
@@ -408,7 +457,7 @@ app.post('/api/build', (req, res) => {
     return res.status(400).json({ error: 'A build is already in progress' });
   }
 
-  const { platform, config, enginePath, projectPath, gitRevision } = req.body;
+  const { platform, config, enginePath, projectPath, gitRevision, cleanBuild, clearCache } = req.body;
   if (!platform || !config) {
     return res.status(400).json({ error: 'Missing platform or config' });
   }
@@ -429,11 +478,13 @@ app.post('/api/build', (req, res) => {
     try {
       const finalEnginePath  = enginePath  || 'F:\\wz\\UE_CICD\\UnrealEngine\\UnrealEngine';
       const finalProjectPath = projectPath || 'F:\\wz\\UE_CICD\\SampleProject';
-      const ctx = { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision };
+      const ctx = { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision, cleanBuild, clearCache };
 
-      // STEP 1/5: 로컬 변경사항 존재 여부 확인 (충돌 방지)
-      broadcast({ type: 'STEP', ...BUILD_STEPS.GIT_CHECK, buildId });
-      broadcast({ type: 'LOG',  data: `[Git] Step 1/5 local changes check` });
+      const STEPS = getBuildSteps(clearCache);
+
+      // STEP 1: 로컬 변경사항 존재 여부 확인 (충돌 방지)
+      broadcast({ type: 'STEP', ...STEPS.GIT_CHECK, buildId });
+      broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_CHECK.step}/${STEPS.GIT_CHECK.total} local changes check` });
 
       const { stdout: statusOut } = await execAsync(`git -C "${finalProjectPath}" status --porcelain`);
       const changedFiles = statusOut.trim().split('\n').filter(Boolean)

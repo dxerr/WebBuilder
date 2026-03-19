@@ -113,7 +113,9 @@ const BAT_SCRIPT_PATH = 'F:\\wz\\UE_CICD\\SampleProject\\BuildProject.bat';
   "config":      "Development | Debug | Shipping",
   "enginePath":  "F:\\wz\\UE_CICD\\UnrealEngine\\UnrealEngine",
   "projectPath": "F:\\wz\\UE_CICD\\SampleProject",
-  "gitRevision": "(optional) commit hash or branch name"
+  "gitRevision": "(optional) commit hash or branch name",
+  "cleanBuild":  false,
+  "clearCache":  false
 }
 ```
 
@@ -126,7 +128,10 @@ const BAT_SCRIPT_PATH = 'F:\\wz\\UE_CICD\\SampleProject\\BuildProject.bat';
 | 2/5 | Git Fetch    | `git fetch --all` | gitRevision 지정 시만 |
 | 3/5 | Git Checkout | 로컬 브랜치: `git checkout` / 리모트 전용: `git checkout -B --track origin/` | |
 | 4/5 | Git Pull     | 브랜치인 경우만 `git pull`, 커밋/태그면 스킵 | |
-| 5/5 | Build        | `BuildProject.bat {platform} {config}` | |
+| 5/N | Clear Cache  | `clearCache=true`일 때만: Intermediate/Saved/Binaries/XmlConfigCache.bin 삭제 | **조건부 단계** |
+| N/N | Build        | `BuildProject.bat {platform} {config} [-clean]` | cleanBuild=true 시 `-clean` 인자 추가 |
+
+> **N = 5 (기본) 또는 6 (clearCache 활성화 시)**. 동적 스텝 시스템으로 UI 스텝퍼와 로그에 반영됨.
 
 #### 신규 API
 - `POST /api/build/confirm` — Revert 동의 후 빌드 재개 (`git checkout -- .` 후 executeBuild)
@@ -372,4 +377,6 @@ UE_Web_Builder/
 | 5 | SQLite Analytics & History | ✅ 완료 |
 | 6 | Git Revision Control (datalist 방식) | ✅ 완료 |
 | 7 | Git Revision Picker 개선 (브랜치/태그/커밋 탭 드롭다운, fetch --all 연동) | ✅ 완료 |
-| 8 | Naver Works 알림 연동 | ⬜ 미구현 (옵션) |
+| 8 | Clean Build / Clear Cache 옵션 (토글 UI + 확인 모달 + 동적 스텝 + BAT -clean 전달) | ✅ 완료 |
+| 9 | Horde 분산빌드 연동 (BuildConfiguration.xml + -UBA 플래그) | ✅ 완료 |
+| 10 | Naver Works 알림 연동 | ⬜ 미구현 (옵션) |

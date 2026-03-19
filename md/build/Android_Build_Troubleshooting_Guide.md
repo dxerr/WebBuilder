@@ -25,8 +25,11 @@
 2. **UBT 재컴파일**:
    - 터미널(CMD/PowerShell)을 열고 구동합니다:
    - `F:\wz\UE_CICD\UnrealEngine\UnrealEngine\Engine\Binaries\ThirdParty\DotNet\8.0.412\win-x64\dotnet.exe build F:\wz\UE_CICD\UnrealEngine\UnrealEngine\Engine\Source\Programs\UnrealBuildTool\UnrealBuildTool.csproj -c Development` (엔진 경로에 맞게 실행)
-3. **캐시 비우기**:
-   - 찌꺼기 파일이 문제를 유지시킬 수 있으므로 `[프로젝트 경로]\Intermediate\Android\arm64\gradle` 폴더를 통째로 삭제한 후 요소를 다시 빌드합니다.
+3. **Node.js 파이프라인 (Web Builder) 환경 변수 강제 주입**:
+   - `UEDeployAndroid.cs`에서 옵션을 지웠더라도 백그라운드 노드 환경의 네트워크 제한/특성 때문에 Gradle 데몬이 IPv6 루프백 소켓 바인딩을 실패할 수 있습니다.
+   - `[프로젝트 경로]\UE_Web_Builder\backend\index.js` 내의 서브프로세스(`spawn`) 호출 시 강제로 `_JAVA_OPTIONS: '-Djava.net.preferIPv4Stack=true'` 환경 변수를 주입해서 데몬이 IPv4 통신을 사용하도록 유도합니다.
+4. **캐시 비우기**:
+   - 찌꺼기 파일이 문제를 유지시킬 수 있으므로 `[프로젝트 경로]\Intermediate\Android\arm64\gradle` 폴더를 통째로 삭제한 후 다시 빌드합니다.
 
 ---
 

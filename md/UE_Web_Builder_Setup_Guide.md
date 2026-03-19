@@ -229,32 +229,43 @@ index.js
 └── API 엔드포인트 목록
 ```
 
-### 5.2 빌드 파이프라인 5단계 흐름
+### 5.2 빌드 파이프라인 흐름 (5단계 또는 6단계)
+
+스텝 수는 `clearCache` 옵션에 따라 **동적으로 결정**됨 (5 또는 6).
 
 ```
-POST /api/build 수신
+POST /api/build 수신 (cleanBuild, clearCache 파라미터 포함)
       │
       ▼
-[STEP 1/5] Git Check   → git status --porcelain
+[STEP 1/N] Git Check   → git status --porcelain
       │ 변경사항 있으면 → CONFIRM_REVERT WebSocket 전송 → 사용자 확인 대기
       │ 없으면 계속
       ▼
-[STEP 2/5] Git Fetch   → git fetch --all
+[STEP 2/N] Git Fetch   → git fetch --all
       ▼
-[STEP 3/5] Git Checkout
+[STEP 3/N] Git Checkout
       │ gitRevision 지정됨 → git checkout {revision}
       │ gitRevision 없음   → 현재 브랜치 유지 (HEAD)
       ▼
-[STEP 4/5] Git Pull
+[STEP 4/N] Git Pull
       │ 일반 브랜치   → git pull
       │ Detached HEAD → 스킵
       ▼
-[STEP 5/5] Build
-      └── BuildProject.bat 실행 (spawn)
+[STEP 5/N] Clear Cache (**clearCache=true 일 때만 실행**)
+      │ XmlConfigCache.bin 삭제
+      │ Intermediate/ 폴더 삭제
+      │ Saved/ 폴더 삭제
+      │ Binaries/ 폴더 삭제
+      ▼
+[STEP N/N] Build
+      └── BuildProject.bat {platform} {config} [-clean] 실행 (spawn)
+              ├── cleanBuild=true 시 -clean 인자 추가
               ├── stdout → LOG WebSocket
               ├── stderr → LOG_ERROR WebSocket (lastErrorLine 추적)
               └── close  → STATUS WebSocket (archivePath / lastError 포함)
 ```
+
+> **N = 5** (기본) 또는 **N = 6** (clearCache 활성화 시). UI 스텝퍼와 로그 번호가 동적으로 조정됨.
 
 ### 5.3 주요 전역 변수 설명
 
@@ -262,6 +273,8 @@ POST /api/build 수신
 |------|------|------|
 | `activeBuildProcess` | ChildProcess \| null | 현재 빌드 프로세스 참조. null이면 빌드 없음 |
 | `isPreparingBuild` | boolean | git 단계 진행 중 중복 요청 차단 |
+| `clearCache` | boolean (req) | 빌드 전 Intermediate/Saved/Binaries 폴더 삭제 여부 |
+| `cleanBuild` | boolean (req) | UAT에 -clean 플래그 전달 여부 |
 | `isCancelling` | boolean | 취소 요청 시 close 핸들러에서 status를 Canceled로 처리 |
 | `lastErrorLine` | string | stdout/stderr에서 error/failed 패턴 라인 실시간 갱신 |
 | `pendingBuildContext` | object \| null | Revert 대기 중 빌드 파라미터 임시 보관 |
@@ -352,7 +365,15 @@ interface BuildResult {
 예: F:\wz\UE_CICD\SampleProject\BuildProject.bat
 ```
 
-### 7.2 BAT 파일 템플릿
+### 7.2 BAT 파일 인수
+
+| 순서 | 인자 | 예시 | 설명 |
+|------|------|------|------|
+| %1 | Platform | Win64 | 대상 플랫폼 |
+| %2 | Config | Development | 빌드 설정 |
+| %3 | -clean (선택) | -clean | cleanBuild=true 시 백엔드에서 자동 전달, UAT에 -clean 플래그 추가 |
+
+### 7.3 BAT 파일 템플릿
 
 아래 내용을 참고하여 새 환경에 맞게 경로를 수정한다.
 
@@ -498,7 +519,9 @@ Base URL: `http://{서버IP}:3001/api`
   "config":      "Development",
   "enginePath":  "F:\\UnrealEngine",
   "projectPath": "F:\\SampleProject",
-  "gitRevision": "main"   // 선택사항. 비우면 현재 HEAD 그대로
+  "gitRevision": "main",
+  "cleanBuild":  false,
+  "clearCache":  false
 }
 ```
 ```json
@@ -637,19 +660,35 @@ Base URL: `http://{서버IP}:3001/api`
 
 ### 10.3 STEP 메시지 단계 목록
 
-| step | label |
-|------|-------|
-| 1/5 | Git Check |
-| 2/5 | Git Fetch |
-| 3/5 | Git Checkout |
-| 4/5 | Git Pull |
-| 5/5 | Build |
+| step | label | 비고 |
+|------|-------|------|
+| 1/N | Git Check | |
+| 2/N | Git Fetch | |
+| 3/N | Git Checkout | |
+| 4/N | Git Pull | |
+| 5/N | Clear Cache | clearCache=true 일 때만 (빨간색 스텝) |
+| N/N | Build | N=5 또는 6 |
 
 ---
 
 ## 11. 주요 기능 설명
 
-### 11.1 Git Revision Picker
+### 11.1 Clean Build / Clear Cache 옵션
+
+Launch Editor Build 버튼 왼쪽에 iOS 스타일 토글 스위치 2개가 위치:
+
+| 옵션 | UI 색상 | 동작 |
+|--------|-----------|------|
+| **Clean Build** | 파란색 토글 | UAT BuildCookRun에 `-clean` 플래그 전달 |
+| **Clear Cache** | 빨간색 토글 | 빌드 전 `Intermediate/`, `Saved/`, `Binaries/`, `XmlConfigCache.bin` 삭제 |
+
+**Clear Cache 활성화 시:**
+- 빌드 버튼 클릭 → 경고 모달 팝업 (삭제 대상 목록 표시)
+- 사용자 확인 후에만 실제 삭제 + 빌드 진행
+- System Status 스텝퍼에 **Clear Cache** 단계가 빨간색으로 표시됨 (6단계 모드)
+- 터미널 로그에 `[Clean] Target: {projectPath}` 및 각 폴더 삭제 결과 출력
+
+### 11.2 Git Revision Picker
 
 사이드바 드롭다운으로 브랜치 / 태그 / 커밋 해시 선택 가능.  
 - **브랜치 탭**: 로컬 + 리모트 브랜치 표시 (리모트는 보라색 `remote` 배지)
@@ -657,7 +696,7 @@ Base URL: `http://{서버IP}:3001/api`
 - **커밋 탭**: 선택한 브랜치 기준 커밋 목록
 - **빈값(HEAD)**: 현재 브랜치 그대로 유지하고 pull만 실행
 
-### 11.2 로컬 변경사항 Revert 플로우
+### 11.3 로컬 변경사항 Revert 플로우
 
 1. 빌드 시작 시 `git status --porcelain` 실행
 2. tracked 파일 변경 감지 시 → `CONFIRM_REVERT` WebSocket 전송
@@ -665,7 +704,7 @@ Base URL: `http://{서버IP}:3001/api`
    - **Revert 후 빌드 진행**: `POST /api/build/confirm` → `git checkout -- .` 후 빌드 재개
    - **빌드 취소**: `POST /api/build/cancel`
 
-### 11.3 빌드 결과 카드 (System Status 하단)
+### 11.4 빌드 결과 카드 (System Status 하단)
 
 - 빌드 완료 시 사이드바 System Status 패널 하단에 자동 표시
 - **성공**: 초록 카드 + 소요시간 + 아카이브 경로 버튼
@@ -674,7 +713,7 @@ Base URL: `http://{서버IP}:3001/api`
 - **취소**: 카드 미표시
 - 새 빌드 시작 시 이전 결과 카드 초기화
 
-### 11.4 비상 복구 엔드포인트
+### 11.5 비상 복구 엔드포인트
 
 빌드 상태가 잠겨 새 빌드를 시작할 수 없을 때:
 ```cmd
@@ -763,5 +802,7 @@ tracked 파일에 로컬 변경사항이 있어 checkout 불가.
 - [ ] `backend` 폴더에서 `node index.js` 실행 → `Build Server running` 확인
 - [ ] `frontend` 폴더에서 `npm run dev` 실행 → 브라우저 접속 확인
 - [ ] UI에서 Engine/Project 경로 입력 후 빌드 테스트
+- [ ] Clean Build 토글 작동 확인 (UAT 로그에 -clean 플래그 표시)
+- [ ] Clear Cache 토글 작동 확인 (경고 모달 + 폴더 삭제 로그 + 6단계 스텝퍼)
 - [ ] 빌드 완료 후 System Status 하단 결과 카드 표시 확인
 - [ ] 아카이브 경로 버튼 클릭 → 탐색기 오픈 확인
