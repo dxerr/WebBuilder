@@ -83,7 +83,7 @@ const BAT_SCRIPT_PATH = 'F:\\wz\\UE_CICD\\SampleProject\\BuildProject.bat';
 
 | 메서드 | 경로 | 설명 |
 |--------|------|------|
-| `GET` | `/api/git/refs?path=` | 브랜치 목록 + 태그 목록 + currentBranch 반환 **(신규)** |
+| `GET` | `/api/git/refs?path=` | `git fetch --all --prune` 후 브랜치 목록 + 태그 목록 + currentBranch 반환 |
 | `GET` | `/api/git/commits?path=&branch=` | 로컬 `git log` 또는 GitHub API로 커밋 50개 조회, branch 파라미터 추가 |
 | `POST` | `/api/build` | 빌드 트리거 |
 | `POST` | `/api/build/cancel` | 진행 중 빌드 강제 종료 (`taskkill /f /t`) |
@@ -110,28 +110,43 @@ const BAT_SCRIPT_PATH = 'F:\\wz\\UE_CICD\\SampleProject\\BuildProject.bat';
 ```json
 {
   "platform":    "Win64 | Android | IOS",
-  "config":      "Development | Debug | Shipping",
+  "config":      "Development | Debug | Test | Shipping",
   "enginePath":  "F:\\wz\\UE_CICD\\UnrealEngine\\UnrealEngine",
   "projectPath": "F:\\wz\\UE_CICD\\SampleProject",
   "gitRevision": "(optional) commit hash or branch name",
   "cleanBuild":  false,
-  "clearCache":  false
+  "clearCache":  false,
+  "cookClean":   false
 }
 ```
+
+> **세 옵션은 상호배제.** `cleanBuild`, `cookClean`, `clearCache` 중 하나를 ON하면 나머지 둘은 자동 OFF됨 (프론트 `toggleCleanBuild / toggleCookClean / toggleClearCache` 핸들러에서 강제).
+
+### 빌드 옵션 비교
+
+| 옵션 | 파라미터 | 처리 위치 | 동작 |
+|------|---------|----------|------|
+| **Clean Build** | `cleanBuild: true` | BAT → UBT | `-clean` 플래그 전달 → C++ 포함 전체 풀리빌드 |
+| **Cook Clean** | `cookClean: true` | Node.js(사전 삭제) + BAT → UAT | `Saved/Cooked`, `Saved/ShaderDebugInfo`, `DerivedDataCache` 삭제 후 `-nocompileeditor -skipbuildeditor -nocompile -clearcookeddata` 플래그로 셰이더·에셋만 재쿡 (C++ 빌드 생략) |
+| **Clear Cache** | `clearCache: true` | Node.js(사전 삭제) | `Intermediate/`, `Saved/`, `Binaries/`, `XmlConfigCache.bin` 전체 삭제 후 풀빌드 |
 
 ### 빌드 실행 흐름 (단계별 순차 처리)
 
 | Step | Phase | 동작 | 비고 |
 |------|-------|------|------|
-| 1/5 | Git Check    | `git status --porcelain` — 로컬 변경사항 감지 | 변경사항 있으면 `CONFIRM_REVERT` 메시지 → 모달 대기 |
+| 1/N | Git Check    | `git status --porcelain` — 로컬 변경사항 감지 | 변경사항 있으면 `CONFIRM_REVERT` 메시지 → 모달 대기 |
 | —   | (사용자 확인) | Revert 후 진행 / 빌드 취소 선택 | `POST /api/build/confirm` or `/cancel` |
-| 2/5 | Git Fetch    | `git fetch --all` | gitRevision 지정 시만 |
-| 3/5 | Git Checkout | 로컬 브랜치: `git checkout` / 리모트 전용: `git checkout -B --track origin/` | |
-| 4/5 | Git Pull     | 브랜치인 경우만 `git pull`, 커밋/태그면 스킵 | |
-| 5/N | Clear Cache  | `clearCache=true`일 때만: Intermediate/Saved/Binaries/XmlConfigCache.bin 삭제 | **조건부 단계** |
-| N/N | Build        | `BuildProject.bat {platform} {config} [-clean]` | cleanBuild=true 시 `-clean` 인자 추가 |
+| 2/N | Git Fetch    | `git fetch --all` | |
+| 3/N | Git Checkout | 로컬 브랜치: `git checkout` / 리모트 전용: `git checkout -B --track origin/` | |
+| 4/N | Git Pull     | 브랜치인 경우만 `git pull`, 커밋/태그면 스킵 | |
+| ∗/N | Clear Cache  | `clearCache=true`일 때만: `Intermediate/` `Saved/` `Binaries/` `XmlConfigCache.bin` 삭제 | **조건부 단계** |
+| ∗/N | Cook Clean   | `cookClean=true`일 때만: `Saved/Cooked/` `Saved/ShaderDebugInfo/` `DerivedDataCache/` 삭제 | **조건부 단계** (Clear Cache와 상호배제) |
+| ∗/N | Build        | `BuildProject.bat {platform} {config} [-clean\|-cookclean]` | `cleanBuild=true` → `-clean` / `cookClean=true` → `-cookclean` |
+| ∗/N | Sentry Upload | `sentry-cli debug-files upload` — 빌드 성공 시에만 | **조건부 단계** (sentry.properties 존재 시) |
 
-> **N = 5 (기본) 또는 6 (clearCache 활성화 시)**. 동적 스텝 시스템으로 UI 스텝퍼와 로그에 반영됨.
+> **N = 5 (기본) / 6 (옵션 1개 활성) / 7 (옵션 + Sentry)**. 동적 스텝 시스템으로 UI 스텝퍼와 로그에 반영됨.
+>
+> **스텝 색상 코드:** Git 단계 기본색(파랑) / Clear Cache → 빨간(`#ef4444`) / Cook Clean → 오렌지(`#f97316`) / Sentry Upload → 보라(`#a855f7`)
 
 #### 신규 API
 - `POST /api/build/confirm` — Revert 동의 후 빌드 재개 (`git checkout -- .` 후 executeBuild)
@@ -163,7 +178,7 @@ const BAT_SCRIPT_PATH = 'F:\\wz\\UE_CICD\\SampleProject\\BuildProject.bat';
 | `LOG_ERROR` | 에러 문자열 | stderr 에러 로그 |
 | `STEP` | `{ step, total, label }` | 현재 진행 단계 (1~4) — 프론트 스텝퍼 갱신용 **(신규)** |
 | `GIT_DONE` | — | Git 전 단계 완료, 빌드 진입 직전 **(신규)** |
-| `STATUS` | 상태 문자열 | `Build Started`, `Build Success`, `Build Failed`, `Canceled` |
+| `STATUS` | 상태 문자열 + sentryStatus | `Build Started`, `Build Success`, `Build Failed`, `Canceled` + `sentryStatus: success/failed/skipped/null` |
 
 **클라이언트 수신 처리 (App.tsx)**
 
@@ -192,7 +207,7 @@ ws.onmessage = (event) => {
 CREATE TABLE IF NOT EXISTS builds (
   id               TEXT PRIMARY KEY,    -- UUID v4
   platform         TEXT,                -- Win64 / Android / IOS
-  config           TEXT,                -- Development / Debug / Shipping
+  config           TEXT,                -- Development / Debug / Test / Shipping
   status           TEXT,                -- Running / Success / Failed / Canceled
   start_time       DATETIME DEFAULT CURRENT_TIMESTAMP,
   end_time         DATETIME,
@@ -218,7 +233,16 @@ CREATE TABLE IF NOT EXISTS builds (
 | `gitRepoPath` | string | Git Picker에서 사용하는 레포지토리 경로 |
 | `gitRevision` | string | 선택된 브랜치명 / 태그명 / 커밋 해시 |
 | `buildStep` | `{ step, total, label } \| null` | 현재 진행 단계 (STEP 메시지 수신 시 갱신) |
+| `buildStepLabels` | `{ step, label, isDanger?, isCookClean?, isSentry? }[]` | 동적 스텝 라벨 배열 (STEP 메시지로 누적 구축) |
 | `buildStatus` | string | 빌드 상태 텍스트 |
+| `isBuilding` | boolean | 빌드 진행 중 여부 |
+| `cleanBuild` | boolean | Clean Build 옵션 (C++ 포함 풀리빌드, `-clean` 전달) |
+| `cookClean` | boolean | Cook Clean 옵션 (셰이더·에셋만 재쿡, C++ 생략) |
+| `clearCache` | boolean | Clear Cache 옵션 (Intermediate/Saved/Binaries 전체 삭제) |
+| `clearCacheConfirm` | boolean | Clear Cache 확인 모달 표시 여부 |
+| `isBuildLocked` | boolean | 빌드 락 감지 여부 (비정상 종료 후 재접속 시) |
+| `revertConfirm` | `{ buildId, files } \| null` | 로컬 변경사항 Revert 확인 모달 데이터 |
+| `buildResult` | `BuildResult \| null` | 최근 빌드 결과 (status, archivePath, lastError, durationSeconds, sentryStatus) |
 | `logs` | string[] | 터미널 로그 목록 (최대 300줄) |
 | `history` | any[] | 빌드 이력 |
 | `analytics` | any | 통계 데이터 |
@@ -238,7 +262,7 @@ CREATE TABLE IF NOT EXISTS builds (
 ### Build Launcher 탭
 
 - **Target Platform:** Win64 / Android / iOS (select)
-- **Build Configuration:** Development / Debug / Shipping (select)
+- **Build Configuration:** Development / Debug / Test / Shipping (select)
 - **Git Revision Control:**
   - 레포지토리 경로 입력
   - **GitRevisionPicker 커스텀 드롭다운** (신규):
@@ -249,6 +273,11 @@ CREATE TABLE IF NOT EXISTS builds (
     - 선택 완료 후 하단에 `Will checkout {revision}` 확인 뱃지 표시
   - 비워두면 현재 HEAD 기준 빌드
 - **Engine/Project Path:** 텍스트 입력으로 경로 직접 지정
+- **Build Options (하단 토글 행, 상호배제):**
+  - 🔵 **Clean Build** — `-clean` 플래그 전달, UBT가 C++ 포함 전체 풀리빌드
+  - 🟠 **Cook Clean** — `Saved/Cooked`, `Saved/ShaderDebugInfo`, `DerivedDataCache` 삭제 후 UAT `-clearcookeddata` 플래그로 셰이더·에셋만 재쿡 (C++ 빌드 생략). **세 옵션 중 가장 빠른 전체 리쿡 방법**
+  - 🔴 **Clear Cache** — `Intermediate/`, `Saved/`, `Binaries/`, `XmlConfigCache.bin` 전체 삭제, 확인 모달 표시 후 진행
+  - 세 옵션 중 하나를 ON하면 나머지 둘은 자동 OFF (상호배제)
 - **Launch Button:** 빌드 시작 (파란색 그라디언트)
 - **Cancel Button:** 빌드 중 표시, 클릭 시 confirm 후 `POST /api/build/cancel`
 - **실시간 터미널:** WebSocket 수신, 로그 색상 구분
@@ -379,4 +408,6 @@ UE_Web_Builder/
 | 7 | Git Revision Picker 개선 (브랜치/태그/커밋 탭 드롭다운, fetch --all 연동) | ✅ 완료 |
 | 8 | Clean Build / Clear Cache 옵션 (토글 UI + 확인 모달 + 동적 스텝 + BAT -clean 전달) | ✅ 완료 |
 | 9 | Horde 분산빌드 연동 (BuildConfiguration.xml + -UBA 플래그) | ✅ 완료 |
-| 10 | Naver Works 알림 연동 | ⬜ 미구현 (옵션) |
+| 10 | Sentry Debug Symbol Upload (빌드 성공 시 sentry-cli 자동 실행, 플랫폼별 심볼 경로 매핑) | ✅ 완료 |
+| 11 | Cook Clean 옵션 (셰이더·에셋 쿠킹 캐시만 재생성, C++ 빌드 생략 — 상호배제 토글 + 오렌지 UI + 동적 스텝) | ✅ 완료 |
+| 12 | Naver Works 알림 연동 | ⬜ 미구현 (옵션) |

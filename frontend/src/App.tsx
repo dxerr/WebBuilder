@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Play, Activity, History, Terminal as TerminalIcon, XCircle, GitBranch, GitCommit, Tag, RefreshCw, ChevronDown, Check, FolderOpen, AlertTriangle, CheckCircle2, Trash2, Sparkles } from 'lucide-react';
+import { Play, Activity, History, Terminal as TerminalIcon, XCircle, GitBranch, GitCommit, Tag, RefreshCw, ChevronDown, Check, FolderOpen, AlertTriangle, CheckCircle2, Trash2, Sparkles, Upload, Flame } from 'lucide-react';
 import { format } from 'date-fns';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -13,7 +13,7 @@ const COLORS = ['#38bdf8', '#818cf8', '#34d399', '#f87171'];
 interface CommitInfo  { hash: string; message: string; author: string; time: string; }
 interface RefInfo     { type: 'branch' | 'tag'; name: string; hash: string; message: string; author: string; time: string; isCurrent?: boolean; }
 interface GitRefs     { branches: RefInfo[]; tags: RefInfo[]; currentBranch: string; }
-interface BuildResult { status: 'Success' | 'Failed' | 'Canceled'; archivePath?: string | null; lastError?: string | null; durationSeconds?: number; }
+interface BuildResult { status: 'Success' | 'Failed' | 'Canceled'; archivePath?: string | null; lastError?: string | null; durationSeconds?: number; sentryStatus?: string | null; }
 
 type RevisionTab = 'branches' | 'tags' | 'commits';
 
@@ -298,6 +298,14 @@ function BuildResultCard({ result }: { result: BuildResult }) {
                 {result.durationSeconds && <span style={{ fontWeight: 400, color: 'var(--text-secondary)', marginLeft: '0.4rem' }}>({result.durationSeconds}s)</span>}
               </span>
             </div>
+            {result.sentryStatus && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.5rem' }}>
+                <Upload size={12} color={result.sentryStatus === 'success' ? '#a855f7' : result.sentryStatus === 'failed' ? 'var(--error-color)' : 'var(--text-secondary)'}/>
+                <span style={{ fontSize: '0.72rem', fontWeight: 500, color: result.sentryStatus === 'success' ? '#a855f7' : result.sentryStatus === 'failed' ? 'var(--error-color)' : 'var(--text-secondary)' }}>
+                  Sentry Symbols: {result.sentryStatus === 'success' ? '✅ Uploaded' : result.sentryStatus === 'failed' ? '❌ Failed' : '⏭ Skipped'}
+                </span>
+              </div>
+            )}
             {result.archivePath && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
                 <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary)' }}>아카이브 경로</span>
@@ -368,10 +376,12 @@ export default function App() {
 
   const [cleanBuild, setCleanBuild]   = useState(false);
   const [clearCache, setClearCache]     = useState(false);
+  const [cookClean,  setCookClean]      = useState(false);
   const [clearCacheConfirm, setClearCacheConfirm] = useState(false);
   const [isBuilding, setIsBuilding]   = useState(false);
   const [buildStatus, setBuildStatus] = useState('Idle');
   const [buildStep, setBuildStep]     = useState<{ step: number; total: number; label: string } | null>(null);
+  const [buildStepLabels, setBuildStepLabels] = useState<{ step: number; label: string; isDanger?: boolean; isSentry?: boolean }[]>([]);
   const [buildResult, setBuildResult] = useState<BuildResult | null>(null);
   const [logs, setLogs]               = useState<string[]>([]);
   const [history, setHistory]         = useState<any[]>([]);
@@ -400,6 +410,19 @@ export default function App() {
       } else if (message.type === 'STEP') {
         setBuildStep({ step: message.step, total: message.total, label: message.label });
         setBuildStatus(message.label);
+        // 동적 스텝 라벨 구축: 서버에서 보내주는 step/label로 이미 등록되지 않은 스텝을 누적
+        setBuildStepLabels(prev => {
+          const exists = prev.find(s => s.step === message.step);
+          if (exists) return prev;
+          const newEntry = {
+            step: message.step,
+            label: message.label,
+            isDanger:   message.label === 'Clear Cache',
+            isCookClean: message.label === 'Cook Clean',
+            isSentry:   message.label === 'Sentry Upload',
+          };
+          return [...prev, newEntry].sort((a, b) => a.step - b.step);
+        });
       } else if (message.type === 'GIT_DONE') {
         setBuildStatus('Git Done — Launching Build...');
       } else if (message.type === 'CONFIRM_REVERT') {
@@ -420,6 +443,7 @@ export default function App() {
             archivePath: message.archivePath ?? null,
             lastError:   message.lastError   ?? null,
             durationSeconds: message.durationSeconds ?? null,
+            sentryStatus: message.sentryStatus ?? null,
           });
           fetchHistory();
           fetchAnalytics();
@@ -442,19 +466,37 @@ export default function App() {
     proceedBuild();
   };
 
+  // 상호배제 토글 핸들러
+  const toggleCleanBuild = () => {
+    const next = !cleanBuild;
+    setCleanBuild(next);
+    if (next) { setClearCache(false); setCookClean(false); }
+  };
+  const toggleClearCache = () => {
+    const next = !clearCache;
+    setClearCache(next);
+    if (next) { setCleanBuild(false); setCookClean(false); }
+  };
+  const toggleCookClean = () => {
+    const next = !cookClean;
+    setCookClean(next);
+    if (next) { setCleanBuild(false); setClearCache(false); }
+  };
+
   const proceedBuild = async () => {
 
     setIsBuilding(true);
     setBuildResult(null);
     setLogs([]);
     setBuildStep(null);
+    setBuildStepLabels([]);
     setRevertConfirm(null);
     setBuildStatus('Starting Build...');
     try {
       const res = await fetch(`${API_URL}/build`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ platform, config, enginePath, projectPath, gitRevision, cleanBuild, clearCache })
+        body: JSON.stringify({ platform, config, enginePath, projectPath, gitRevision, cleanBuild, clearCache, cookClean })
       });
       if (res.status === 400) {
         const body = await res.json().catch(() => ({}));
@@ -647,43 +689,35 @@ export default function App() {
                     />
                   </div>
                 </div>
-                {(buildStep && buildStep.total === 6
-                  ? [
-                      { step: 1, label: 'Git Check' },
-                      { step: 2, label: 'Git Fetch' },
-                      { step: 3, label: 'Git Checkout' },
-                      { step: 4, label: 'Git Pull' },
-                      { step: 5, label: 'Clear Cache', isDanger: true },
-                      { step: 6, label: 'Build' },
-                    ]
-                  : [
-                      { step: 1, label: 'Git Check' },
-                      { step: 2, label: 'Git Fetch' },
-                      { step: 3, label: 'Git Checkout' },
-                      { step: 4, label: 'Git Pull' },
-                      { step: 5, label: 'Build' },
-                    ]
+                {(buildStepLabels.length > 0
+                  ? buildStepLabels
+                  : Array.from({ length: buildStep.total }, (_, i) => ({ step: i + 1, label: `Step ${i + 1}` }))
                 ).map(s => {
-                  const done   = s.step < buildStep.step;
-                  const active = s.step === buildStep.step;
-                  const danger = (s as any).isDanger;
-                  const activeColor = danger && active ? '#ef4444' : 'var(--primary-color)';
-                  const doneColor   = danger && done ? '#ef4444' : 'var(--success-color)';
+                  const done    = s.step < buildStep.step;
+                  const active  = s.step === buildStep.step;
+                  const danger  = (s as any).isDanger;
+                  const sentry  = (s as any).isSentry;
+                  const cookCl  = (s as any).isCookClean;
+                  const activeColor = danger ? '#ef4444' : cookCl ? '#f97316' : sentry ? '#a855f7' : 'var(--primary-color)';
+                  const doneColor   = danger ? '#ef4444' : cookCl ? '#f97316' : sentry ? '#a855f7' : 'var(--success-color)';
+                  const glowColor   = danger ? 'rgba(239,68,68,0.6)' : cookCl ? 'rgba(249,115,22,0.6)' : sentry ? 'rgba(168,85,247,0.6)' : 'rgba(56,189,248,0.6)';
                   return (
-                  <div key={s.step} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.2rem 0', fontSize: '0.78rem' }}>
-                  <div style={{
-                  width: '16px', height: '16px', borderRadius: '50%', flexShrink: 0,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  background: done ? doneColor : active ? activeColor : 'rgba(255,255,255,0.08)',
-                  fontSize: '0.6rem', fontWeight: 700,
-                    color: (done || active) ? '#0f172a' : 'var(--text-secondary)',
-                  boxShadow: active ? `0 0 8px ${danger ? 'rgba(239,68,68,0.6)' : 'rgba(56,189,248,0.6)'}` : 'none',
-                    transition: 'all 0.3s'
-                  }}>
-                  {done ? '✓' : s.step}
-                  </div>
-                  <span style={{ color: done ? doneColor : active ? activeColor : 'var(--text-secondary)', fontWeight: active ? 600 : 400 }}>
-                      {s.label}
+                    <div key={s.step} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.2rem 0', fontSize: '0.78rem' }}>
+                      <div style={{
+                        width: '16px', height: '16px', borderRadius: '50%', flexShrink: 0,
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        background: done ? doneColor : active ? activeColor : 'rgba(255,255,255,0.08)',
+                        fontSize: '0.6rem', fontWeight: 700,
+                        color: (done || active) ? '#0f172a' : 'var(--text-secondary)',
+                        boxShadow: active ? `0 0 8px ${glowColor}` : 'none',
+                        transition: 'all 0.3s'
+                      }}>
+                        {done ? '✓' : s.step}
+                      </div>
+                      <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', color: done ? doneColor : active ? activeColor : 'var(--text-secondary)', fontWeight: active ? 600 : 400 }}>
+                        {sentry  && <Upload size={11}/>}
+                        {cookCl  && <Flame  size={11}/>}
+                        {s.label}
                         {active && <motion.span animate={{ opacity: [1, 0.3, 1] }} transition={{ repeat: Infinity, duration: 1.2 }}>...</motion.span>}
                       </span>
                     </div>
@@ -723,6 +757,7 @@ export default function App() {
                   <select className="form-select" value={config} onChange={e => setConfig(e.target.value)}>
                     <option value="Development">Development (Debug Symbols)</option>
                     <option value="Debug">Debug (Detailed)</option>
+                    <option value="Test">Test (Testing/QA)</option>
                     <option value="Shipping">Shipping (Optimized for Release)</option>
                   </select>
                 </div>
@@ -778,7 +813,7 @@ export default function App() {
                   {/* Clean Build Toggle */}
                   <label style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', cursor: 'pointer', userSelect: 'none' }}>
                     <div
-                      onClick={() => setCleanBuild(v => !v)}
+                      onClick={toggleCleanBuild}
                       style={{
                         width: '38px', height: '20px', borderRadius: '999px',
                         background: cleanBuild ? 'var(--primary-color)' : 'rgba(255,255,255,0.1)',
@@ -803,10 +838,38 @@ export default function App() {
                     </div>
                   </label>
 
+                  {/* Cook Clean Toggle */}
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', cursor: 'pointer', userSelect: 'none' }}>
+                    <div
+                      onClick={toggleCookClean}
+                      style={{
+                        width: '38px', height: '20px', borderRadius: '999px',
+                        background: cookClean ? '#f97316' : 'rgba(255,255,255,0.1)',
+                        position: 'relative', transition: 'background 0.2s', cursor: 'pointer',
+                        border: `1px solid ${cookClean ? 'rgba(249,115,22,0.5)' : 'rgba(255,255,255,0.15)'}`,
+                      }}
+                    >
+                      <motion.div
+                        animate={{ x: cookClean ? 18 : 2 }}
+                        transition={{ type: 'spring', stiffness: 500, damping: 30 }}
+                        style={{
+                          width: '16px', height: '16px', borderRadius: '50%',
+                          background: cookClean ? '#fff' : 'rgba(255,255,255,0.4)',
+                          position: 'absolute', top: '1px',
+                          boxShadow: cookClean ? '0 0 6px rgba(249,115,22,0.5)' : 'none',
+                        }}
+                      />
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                      <Flame size={13} style={{ color: cookClean ? '#f97316' : 'var(--text-secondary)' }}/>
+                      <span style={{ fontSize: '0.82rem', fontWeight: 500, color: cookClean ? '#f97316' : 'var(--text-secondary)' }}>Cook Clean</span>
+                    </div>
+                  </label>
+
                   {/* Clear Cache Toggle */}
                   <label style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', cursor: 'pointer', userSelect: 'none' }}>
                     <div
-                      onClick={() => setClearCache(v => !v)}
+                      onClick={toggleClearCache}
                       style={{
                         width: '38px', height: '20px', borderRadius: '999px',
                         background: clearCache ? '#ef4444' : 'rgba(255,255,255,0.1)',

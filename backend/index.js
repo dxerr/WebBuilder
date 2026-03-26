@@ -12,9 +12,104 @@ const Database = require('better-sqlite3');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 
+const fs = require('fs');
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ─── Sentry helpers ─────────────────────────────────────────────────────────
+
+/**
+ * sentry.properties 파일을 파싱하여 auth.token, defaults.org, defaults.project 추출
+ * @param {string} projectRoot - .uproject가 위치한 프로젝트 루트
+ * @returns {{ authToken: string, org: string, project: string } | null}
+ */
+function parseSentryProperties(projectRoot) {
+  const filePath = path.join(projectRoot, 'sentry.properties');
+  if (!fs.existsSync(filePath)) return null;
+  const content = fs.readFileSync(filePath, 'utf8');
+  const props = {};
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('[')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
+    props[trimmed.substring(0, eqIdx).trim()] = trimmed.substring(eqIdx + 1).trim();
+  }
+  const authToken = props['auth.token'];
+  const org       = props['defaults.org'];
+  const project   = props['defaults.project'];
+  if (!authToken || !org || !project) return null;
+  return { authToken, org, project };
+}
+
+/**
+ * 프로젝트 루트에서 .uproject 파일명(확장자 제외)을 탐색하여 PROJECT_NAME 추출
+ * @param {string} projectRoot
+ * @returns {string|null}
+ */
+function getProjectName(projectRoot) {
+  try {
+    const files = fs.readdirSync(projectRoot);
+    const uproject = files.find(f => f.endsWith('.uproject'));
+    if (!uproject) return null;
+    return uproject.replace('.uproject', '');
+  } catch (_) { return null; }
+}
+
+/**
+ * 플랫폼별 sentry-cli debug-files upload 대상 심볼 경로 반환
+ * @param {string} projectRoot
+ * @param {string} projectName
+ * @param {string} platform - Win64 | Android | IOS
+ * @returns {{ symbolPath: string, description: string } | null}
+ */
+function getSentrySymbolPath(projectRoot, projectName, platform) {
+  switch (platform) {
+    case 'Android': {
+      // UBT가 생성하는 _Symbols_v1 폴더 (.so 파일)
+      const symDir = path.join(projectRoot, 'Binaries', 'Android', `${projectName}_Symbols_v1`);
+      if (fs.existsSync(symDir)) return { symbolPath: symDir, description: 'Android .so symbols' };
+      return null;
+    }
+    case 'Win64': {
+      // Win64 빌드 산출물 (.pdb 파일)
+      const symDir = path.join(projectRoot, 'Binaries', 'Win64');
+      if (fs.existsSync(symDir)) return { symbolPath: symDir, description: 'Win64 .pdb symbols' };
+      return null;
+    }
+    case 'IOS': {
+      // iOS dSYM 심볼 (향후 확장)
+      const symDir = path.join(projectRoot, 'Binaries', 'IOS');
+      if (fs.existsSync(symDir)) return { symbolPath: symDir, description: 'iOS dSYM symbols' };
+      return null;
+    }
+    default: return null;
+  }
+}
+
+/**
+ * sentry-cli 실행파일 절대경로를 탐색
+ * @param {string} projectRoot
+ * @returns {string|null}
+ */
+function findSentryCli(projectRoot) {
+  // 프로젝트 내 Sentry 플러그인에 번들된 CLI
+  const candidates = [
+    path.join(projectRoot, 'Plugins', 'Sentry', 'Source', 'ThirdParty', 'CLI', 'sentry-cli-Windows-x86_64.exe'),
+    path.join(projectRoot, 'Plugins', 'Sentry', 'Source', 'Sentry', 'Resources', 'sentry-cli-Windows-x86_64.exe'),
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  // 시스템 PATH에 등록된 sentry-cli 확인
+  try {
+    const { execSync } = require('child_process');
+    const result = execSync('where sentry-cli', { encoding: 'utf8', timeout: 5000 }).trim();
+    if (result) return result.split('\n')[0].trim();
+  } catch (_) {}
+  return null;
+}
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
@@ -91,6 +186,9 @@ setInterval(() => {
 app.get('/api/git/refs', async (req, res) => {
   const repoPath = req.query.path || 'F:\\wz\\UE_CICD\\SampleProject';
   try {
+    // 원격 ref 동기화 (새 브랜치/태그 반영)
+    await execAsync(`git -C "${repoPath}" fetch --all --prune`);
+
     // 현재 활성화된 HEAD 브랜치 획득
     let currentBranch = '';
     try {
@@ -225,26 +323,21 @@ app.get('/api/git/commits', async (req, res) => {
 });
 
 // キ節띉⑤챶
-// step total은 clearCache 여부에 따라 동적으로 결정 (5 or 6)
-function getBuildSteps(hasClearCache) {
-  const total = hasClearCache ? 6 : 5;
-  if (hasClearCache) {
-    return {
-      GIT_CHECK:    { step: 1, total, label: 'Git Check'    },
-      GIT_FETCH:    { step: 2, total, label: 'Git Fetch'    },
-      GIT_SWITCH:   { step: 3, total, label: 'Git Checkout' },
-      GIT_PULL:     { step: 4, total, label: 'Git Pull'     },
-      CLEAR_CACHE:  { step: 5, total, label: 'Clear Cache'  },
-      BUILD_START:  { step: 6, total, label: 'Build'        },
-    };
-  }
-  return {
-    GIT_CHECK:   { step: 1, total, label: 'Git Check'    },
-    GIT_FETCH:   { step: 2, total, label: 'Git Fetch'    },
-    GIT_SWITCH:  { step: 3, total, label: 'Git Checkout' },
-    GIT_PULL:    { step: 4, total, label: 'Git Pull'     },
-    BUILD_START: { step: 5, total, label: 'Build'        },
-  };
+// step total은 clearCache / sentryUpload 여부에 따라 동적으로 결정
+function getBuildSteps(hasClearCache, hasSentryUpload, hasCookClean) {
+  let stepNum = 1;
+  const steps = {};
+  steps.GIT_CHECK   = { step: stepNum++, total: 0, label: 'Git Check'    };
+  steps.GIT_FETCH   = { step: stepNum++, total: 0, label: 'Git Fetch'    };
+  steps.GIT_SWITCH  = { step: stepNum++, total: 0, label: 'Git Checkout' };
+  steps.GIT_PULL    = { step: stepNum++, total: 0, label: 'Git Pull'     };
+  if (hasClearCache)   steps.CLEAR_CACHE   = { step: stepNum++, total: 0, label: 'Clear Cache'     };
+  if (hasCookClean)    steps.COOK_CLEAN    = { step: stepNum++, total: 0, label: 'Cook Clean'      };
+  steps.BUILD_START  = { step: stepNum++, total: 0, label: 'Build'        };
+  if (hasSentryUpload) steps.SENTRY_UPLOAD = { step: stepNum++, total: 0, label: 'Sentry Upload'   };
+  const total = stepNum - 1;
+  for (const key of Object.keys(steps)) steps[key].total = total;
+  return steps;
 }
 
 // gitRevision 戮ャ럦?濡?뎄?筌? (?β돦裕뉛쭚?+ ?洹먮맓嫄嶺뚮ㅄ維筌筌먦끉逾?
@@ -262,8 +355,15 @@ let pendingBuildContext = null;
 
 // 堉キ貫
 async function executeBuild(ctx) {
-  const { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision, cleanBuild, clearCache } = ctx;
-  const STEPS = getBuildSteps(clearCache);
+  const { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision, cleanBuild, clearCache, cookClean } = ctx;
+
+  // Sentry upload 가능 여부 사전 판정 (스텝 수 결정에 필요)
+  const sentryProps   = parseSentryProperties(finalProjectPath);
+  const projectName   = getProjectName(finalProjectPath);
+  const sentryCli     = sentryProps ? findSentryCli(finalProjectPath) : null;
+  const hasSentry     = !!(sentryProps && projectName && sentryCli);
+
+  const STEPS = getBuildSteps(clearCache, hasSentry, cookClean);
   try {
     // -- PHASE 1: Git sync (always runs) ------------------------------------------
 
@@ -363,9 +463,37 @@ async function executeBuild(ctx) {
     }
     if (isCancelling) throw new Error('Canceled during cache clear');
 
+    // -- PHASE 1.6: Cook Clean (optional) -- 셰이더·에셋 쿠킹 캐시만 삭제 (C++ 빌드 생략)
+    if (cookClean) {
+      broadcast({ type: 'STEP', ...STEPS.COOK_CLEAN, buildId });
+      broadcast({ type: 'LOG', data: `[CookClean] Step ${STEPS.COOK_CLEAN.step}/${STEPS.COOK_CLEAN.total} Clearing cooked asset & shader cache...` });
+      broadcast({ type: 'LOG', data: `[CookClean] Target: ${finalProjectPath}` });
+      const fsCC   = require('fs');
+      const pathCC = require('path');
+      const cookDirs = [
+        pathCC.join(finalProjectPath, 'Saved', 'Cooked'),
+        pathCC.join(finalProjectPath, 'Saved', 'ShaderDebugInfo'),
+        pathCC.join(finalProjectPath, 'DerivedDataCache'),
+      ];
+      for (const dir of cookDirs) {
+        if (fsCC.existsSync(dir)) {
+          try {
+            fsCC.rmSync(dir, { recursive: true, force: true });
+            broadcast({ type: 'LOG', data: `[CookClean] Removed: ${dir}` });
+          } catch (e) {
+            broadcast({ type: 'LOG', data: `[CookClean] Warning: ${dir} — ${e.message}` });
+          }
+        } else {
+          broadcast({ type: 'LOG', data: `[CookClean] Skip (not found): ${dir}` });
+        }
+      }
+      broadcast({ type: 'LOG', data: `[CookClean] Cook cache cleared. UAT will recook all shaders & assets.` });
+    }
+    if (isCancelling) throw new Error('Canceled during cook clean');
+
     // PHASE 2: 빌드 명령줄 조립 및 서브프로세스 런처 진입
     broadcast({ type: 'STEP', ...STEPS.BUILD_START, buildId });
-    broadcast({ type: 'LOG',  data: `[Build] Step ${STEPS.BUILD_START.step}/${STEPS.BUILD_START.total} BAT run (${platform} / ${config})${cleanBuild ? ' [Clean Build]' : ''}` });
+    broadcast({ type: 'LOG',  data: `[Build] Step ${STEPS.BUILD_START.step}/${STEPS.BUILD_START.total} BAT run (${platform} / ${config})${cleanBuild ? ' [Clean Build]' : ''}${cookClean ? ' [Cook Clean]' : ''}` });
 
     const batEnv        = {
       ...process.env,
@@ -382,7 +510,8 @@ async function executeBuild(ctx) {
     const actualBatPath = finalProjectPath ? path.join(finalProjectPath, 'BuildProject.bat') : BAT_SCRIPT_PATH;
 
     const batArgs = ['/c', actualBatPath, platform, config];
-    if (cleanBuild) batArgs.push('-clean');
+    if (cleanBuild)   batArgs.push('-clean');
+    if (cookClean)    batArgs.push('-cookclean');
 
     activeBuildProcess = spawn('cmd.exe', batArgs, {
       cwd: finalProjectPath ? finalProjectPath : path.dirname(BAT_SCRIPT_PATH),
@@ -404,7 +533,7 @@ async function executeBuild(ctx) {
       if (lines.length > 0) lastErrorLine = lines[lines.length - 1].trim();
     });
 
-    activeBuildProcess.on('close', (code) => {
+    activeBuildProcess.on('close', async (code) => {
       const endTime         = new Date();
       const durationSeconds = Math.round((endTime - startTime) / 1000);
       let   status          = code === 0 ? 'Success' : 'Failed';
@@ -413,9 +542,63 @@ async function executeBuild(ctx) {
       // 결과 패키지가 저장된 아카이브 절대 경로 문자열 파싱 (UI 탐색기 연동)
       let archivePath = null;
       if (status === 'Success') {
-        const pathLib = require('path');
-        const base = finalProjectPath || pathLib.dirname(BAT_SCRIPT_PATH);
-        archivePath = pathLib.join(base, 'Saved', 'Builds', platform, config);
+        const base = finalProjectPath || path.dirname(BAT_SCRIPT_PATH);
+        archivePath = path.join(base, 'Saved', 'Builds', platform, config);
+      }
+
+      // ─── Sentry Symbol Upload (빌드 성공 시에만) ───
+      let sentryStatus = null;
+      if (status === 'Success' && hasSentry && STEPS.SENTRY_UPLOAD) {
+        broadcast({ type: 'STEP', ...STEPS.SENTRY_UPLOAD, buildId });
+        broadcast({ type: 'LOG',  data: `[Sentry] Step ${STEPS.SENTRY_UPLOAD.step}/${STEPS.SENTRY_UPLOAD.total} Debug symbol upload starting...` });
+        broadcast({ type: 'LOG',  data: `[Sentry] CLI: ${sentryCli}` });
+        broadcast({ type: 'LOG',  data: `[Sentry] Org: ${sentryProps.org} / Project: ${sentryProps.project}` });
+
+        const symbolInfo = getSentrySymbolPath(finalProjectPath, projectName, platform);
+        if (!symbolInfo) {
+          broadcast({ type: 'LOG',  data: `[Sentry] ⚠️ Symbol path not found for platform: ${platform} — skipping upload` });
+          sentryStatus = 'skipped';
+        } else {
+          broadcast({ type: 'LOG',  data: `[Sentry] Symbol target: ${symbolInfo.symbolPath} (${symbolInfo.description})` });
+          try {
+            const sentryResult = await new Promise((resolve, reject) => {
+              const sentryProc = spawn(sentryCli, [
+                'debug-files', 'upload',
+                '--auth-token', sentryProps.authToken,
+                '--org',        sentryProps.org,
+                '--project',    sentryProps.project,
+                symbolInfo.symbolPath
+              ], {
+                cwd: finalProjectPath,
+                env: { ...process.env },
+              });
+
+              sentryProc.stdout.on('data', (d) => {
+                const txt = d.toString('utf8').trim();
+                if (txt) broadcast({ type: 'LOG', data: `[Sentry] ${txt}` });
+              });
+              sentryProc.stderr.on('data', (d) => {
+                const txt = d.toString('utf8').trim();
+                if (txt) broadcast({ type: 'LOG_ERROR', data: `[Sentry] ${txt}` });
+              });
+              sentryProc.on('close', (sentryCode) => resolve(sentryCode));
+              sentryProc.on('error', (err) => reject(err));
+            });
+
+            if (sentryResult === 0) {
+              broadcast({ type: 'LOG', data: `[Sentry] ✅ Debug symbols uploaded successfully` });
+              sentryStatus = 'success';
+            } else {
+              broadcast({ type: 'LOG_ERROR', data: `[Sentry] ❌ Upload failed with exit code ${sentryResult}` });
+              sentryStatus = 'failed';
+            }
+          } catch (sentryErr) {
+            broadcast({ type: 'LOG_ERROR', data: `[Sentry] ❌ Error: ${sentryErr.message}` });
+            sentryStatus = 'failed';
+          }
+        }
+      } else if (status === 'Success' && !hasSentry) {
+        broadcast({ type: 'LOG', data: `[Sentry] sentry.properties 또는 sentry-cli를 찾을 수 없음 — upload 생략` });
       }
 
       db.prepare('UPDATE builds SET status = ?, end_time = ?, duration_seconds = ? WHERE id = ?')
@@ -427,8 +610,9 @@ async function executeBuild(ctx) {
         code,
         durationSeconds,
         buildId,
-        archivePath: status === 'Success' ? archivePath : null,
-        lastError:   status === 'Failed'  ? (lastErrorLine || null) : null,
+        archivePath:  status === 'Success' ? archivePath : null,
+        lastError:    status === 'Failed'  ? (lastErrorLine || null) : null,
+        sentryStatus: sentryStatus,
       });
 
       activeBuildProcess = null;
@@ -457,7 +641,7 @@ app.post('/api/build', (req, res) => {
     return res.status(400).json({ error: 'A build is already in progress' });
   }
 
-  const { platform, config, enginePath, projectPath, gitRevision, cleanBuild, clearCache } = req.body;
+  const { platform, config, enginePath, projectPath, gitRevision, cleanBuild, clearCache, cookClean } = req.body;
   if (!platform || !config) {
     return res.status(400).json({ error: 'Missing platform or config' });
   }
@@ -478,9 +662,14 @@ app.post('/api/build', (req, res) => {
     try {
       const finalEnginePath  = enginePath  || 'F:\\wz\\UE_CICD\\UnrealEngine\\UnrealEngine';
       const finalProjectPath = projectPath || 'F:\\wz\\UE_CICD\\SampleProject';
-      const ctx = { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision, cleanBuild, clearCache };
+      const ctx = { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision, cleanBuild, clearCache, cookClean };
 
-      const STEPS = getBuildSteps(clearCache);
+      // Sentry 사전 판정 (Git Check 스텝 total 표시에 필요)
+      const _sentryProps = parseSentryProperties(finalProjectPath);
+      const _projectName = getProjectName(finalProjectPath);
+      const _sentryCli   = _sentryProps ? findSentryCli(finalProjectPath) : null;
+      const _hasSentry   = !!(_sentryProps && _projectName && _sentryCli);
+      const STEPS = getBuildSteps(clearCache, _hasSentry, cookClean);
 
       // STEP 1: 로컬 변경사항 존재 여부 확인 (충돌 방지)
       broadcast({ type: 'STEP', ...STEPS.GIT_CHECK, buildId });
