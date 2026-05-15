@@ -525,8 +525,8 @@ async function executeBuild(ctx) {
     const actualBatPath = finalProjectPath ? path.join(finalProjectPath, 'BuildProject.bat') : BAT_SCRIPT_PATH;
 
     const batArgs = ['/c', actualBatPath, platform, config];
-    if (cleanBuild)                           batArgs.push('-clean');
-    if (cookClean && platform !== 'Win64Server') batArgs.push('-cookclean'); // 서버 빌드는 cook 단계 없음
+    if (cleanBuild) batArgs.push('-clean');
+    if (cookClean)  batArgs.push('-cookclean');
 
     activeBuildProcess = spawn('cmd.exe', batArgs, {
       cwd: finalProjectPath ? finalProjectPath : path.dirname(BAT_SCRIPT_PATH),
@@ -563,53 +563,36 @@ async function executeBuild(ctx) {
         archivePath = path.join(base, 'Saved', 'Builds', platform, config);
       }
 
-      // ─── Win64Server 후처리: 바이너리 → Saved/Builds 아카이브 복사 ───────
-      // UAT를 거치지 않아 Stage/Archive 단계가 없으므로 수동으로 복사
+      // ─── Win64Server 후처리: 런처 bat 생성 ───────────────────────────────
+      // UAT -server 모드로 빌드 시 Stage/Archive는 UAT가 직접 처리
+      // 실행 편의를 위해 -log 플래그 포함 런처 bat만 별도 생성
       if (status === 'Success' && platform === 'Win64Server') {
         try {
           const base        = finalProjectPath || path.dirname(BAT_SCRIPT_PATH);
-          const srcDir      = path.join(base, 'Binaries', 'Win64');
           const destDir     = path.join(base, 'Saved', 'Builds', platform, config);
           const projectName = getProjectName(base) || 'ExFrameWork';
 
           fs.mkdirSync(destDir, { recursive: true });
 
-          // 복사 대상: Server 실행파일 + 필수 런타임 dll
-          const copyTargets = [
-            `${projectName}Server.exe`,
-            `${projectName}Server.pdb`,
-            `${projectName}Server.target`,
-            'tbb12.dll',
-            'tbbmalloc.dll',
-          ];
-
-          let copiedCount = 0;
-          for (const fileName of copyTargets) {
-            const src  = path.join(srcDir, fileName);
-            const dest = path.join(destDir, fileName);
-            if (fs.existsSync(src)) {
-              fs.copyFileSync(src, dest);
-              blogLog('LOG', `[ServerArchive] Copied: ${fileName}`);
-              copiedCount++;
-            }
-          }
-
-          // 런처 .bat 생성
-          // ExFrameWorkServer.exe는 상대경로(../../../)로 .uproject를 탐색하므로
-          // 반드시 Binaries\Win64\ 를 작업 디렉토리로 설정해야 함
-          const shortcutBat = path.join(destDir, `Run_${projectName}Server.bat`);
-          const binDir = path.join(base, 'Binaries', 'Win64');
+          // UAT Stage 결과 위치: <archiveDir>/WindowsServer/<ProjectName>Server.exe
+          const stagedExeDir = path.join(destDir, 'WindowsServer');
+          const shortcutBat  = path.join(destDir, `Run_${projectName}Server.bat`);
           const shortcutContent = [
             `@echo off`,
-            `cd /d "${binDir}"`,
-            `start "" "${projectName}Server.exe" -log -port=7777`,
+            `cd /d "${stagedExeDir}"`,
+            `echo [Server] Starting ${projectName}Server...`,
+            `echo [Server] WorkDir: %CD%`,
+            `echo.`,
+            `${projectName}Server.exe -log -port=7777`,
+            `echo.`,
+            `echo [Server] Process exited with code: %ERRORLEVEL%`,
+            `pause`,
           ].join('\r\n');
           fs.writeFileSync(shortcutBat, shortcutContent, 'utf8');
-          blogLog('LOG', `[ServerArchive] Created launcher: Run_${projectName}Server.bat`);
-
-          blogLog('LOG', `[ServerArchive] ✅ ${copiedCount} files archived to: ${destDir}`);
+          blogLog('LOG', `[ServerArchive] ✅ Launcher created: Run_${projectName}Server.bat`);
+          blogLog('LOG', `[ServerArchive] Staged server path: ${stagedExeDir}`);
         } catch (archiveErr) {
-          blogLog('LOG', `[ServerArchive] ⚠️ Archive copy failed: ${archiveErr.message}`);
+          blogLog('LOG', `[ServerArchive] ⚠️ Launcher creation failed: ${archiveErr.message}`);
         }
       }
 

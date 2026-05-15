@@ -746,12 +746,7 @@ export default function App() {
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem', marginBottom: '1.5rem' }}>
                 <div className="form-group">
                   <label className="form-label">Target Platform</label>
-                  <select className="form-select" value={platform} onChange={e => {
-                    const val = e.target.value;
-                    setPlatform(val);
-                    // 서버 빌드는 Cook이 없으므로 Cook Clean 자동 해제
-                    if (val === 'Win64Server') setCookClean(false);
-                  }}>
+                  <select className="form-select" value={platform} onChange={e => setPlatform(e.target.value)}>
                     <option value="Win64">Windows (Win64)</option>
                     <option value="Android">Android</option>
                     <option value="IOS">iOS</option>
@@ -844,10 +839,10 @@ export default function App() {
                     </div>
                   </label>
 
-                  {/* Cook Clean Toggle — 서버 빌드는 Cook 단계 없으므로 비활성화 */}
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', cursor: platform === 'Win64Server' ? 'not-allowed' : 'pointer', userSelect: 'none', opacity: platform === 'Win64Server' ? 0.4 : 1 }}>
+                  {/* Cook Clean Toggle */}
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', cursor: 'pointer', userSelect: 'none' }}>
                     <div
-                      onClick={platform === 'Win64Server' ? undefined : toggleCookClean}
+                      onClick={toggleCookClean}
                       style={{
                         width: '38px', height: '20px', borderRadius: '999px',
                         background: cookClean ? '#f97316' : 'rgba(255,255,255,0.1)',
