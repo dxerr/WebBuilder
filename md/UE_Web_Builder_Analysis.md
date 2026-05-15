@@ -143,6 +143,8 @@ const BAT_SCRIPT_PATH = 'F:\\wz\\UE_CICD\\SampleProject\\BuildProject.bat';
 | ∗/N | Cook Clean   | `cookClean=true`일 때만: `Saved/Cooked/` `Saved/ShaderDebugInfo/` `DerivedDataCache/` 삭제 | **조건부 단계** (Clear Cache와 상호배제) |
 | ∗/N | Build        | `BuildProject.bat {platform} {config} [-clean\|-cookclean]` | `cleanBuild=true` → `-clean` / `cookClean=true` → `-cookclean` |
 | ∗/N | Sentry Upload | `sentry-cli debug-files upload` — 빌드 성공 시에만 | **조건부 단계** (sentry.properties 존재 시) |
+| —   | Log Save     | `Saved/Builds/{platform}/{config}/Log/build_{ts}.log` 저장 | 빌드 완료 후 항상 실행 |
+| —   | Issue Save   | `Saved/Builds/{platform}/{config}/Issue/issue_{ts}.md` 저장 | 로그에서 Warning/Error 추출·중복 제거 후 저장 |
 
 > **N = 5 (기본) / 6 (옵션 1개 활성) / 7 (옵션 + Sentry)**. 동적 스텝 시스템으로 UI 스텝퍼와 로그에 반영됨.
 >
@@ -351,6 +353,24 @@ WS URL:   ws://{hostname}:3001
 API URL:  http://{hostname}:3001/api
 ```
 
+### 빌드 산출 폴더 구조
+
+```
+SampleProject\Saved\Builds\{Platform}\{Config}\
+├── (빌드 결과물 — APK, PAK 등)
+├── Log\
+│   └── build_{timestamp}.log    ← 전체 빌드 로그 (git + build + sentry)
+└── Issue\
+    └── issue_{timestamp}.md     ← Warning/Error 필터링 리포트 (Markdown)
+```
+
+**Issue 파일 생성 규칙:**
+- UE 자체 요약 섹션(`LogInit: Display: Warning/Error Summary`) 중복 제외
+- `: Warning:` 패턴 → Warnings 목록 (중복 제거)
+- `: Error:` 패턴 → Errors 목록 (단순 카운트 라인 제외, 중복 제거)
+- 빌드 성공/실패/취소 무관하게 항상 생성
+- 터미널 출력: `[WebBuilder] 🔍 Issue report saved: ... (N errors, N warnings)`
+
 ---
 
 ## 10. 실행 방법
@@ -410,4 +430,6 @@ UE_Web_Builder/
 | 9 | Horde 분산빌드 연동 (BuildConfiguration.xml + -UBA 플래그) | ✅ 완료 |
 | 10 | Sentry Debug Symbol Upload (빌드 성공 시 sentry-cli 자동 실행, 플랫폼별 심볼 경로 매핑) | ✅ 완료 |
 | 11 | Cook Clean 옵션 (셰이더·에셋 쿠킹 캐시만 재생성, C++ 빌드 생략 — 상호배제 토글 + 오렌지 UI + 동적 스텝) | ✅ 완료 |
-| 12 | Naver Works 알림 연동 | ⬜ 미구현 (옵션) |
+| 12 | Issue 리포트 자동 생성 (빌드 완료 시 로그에서 Warning/Error 필터·중복 제거 → Issue 폴더에 Markdown 저장) | ✅ 완료 |
+| 13 | Dedicated Server 빌드 타입 추가 (Win64Server — UBT Build.bat 직접 호출, Cook/Stage/Package 생략, Cook Clean 자동 비활성화, Sentry .pdb 심볼 경로 매핑) | ✅ 완료 |
+| 14 | Naver Works 알림 연동 | ⬜ 미구현 (옵션) |

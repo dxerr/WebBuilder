@@ -16,7 +16,19 @@
 언리얼 엔진 5의 원본 소스코드인 `UEDeployAndroid.cs` 에는 과거 윈도우 버전의 호환성을 위해 `set _JAVA_OPTIONS=-Djava.nio.channels.spi.SelectorProvider=sun.nio.ch.WindowsSelectorProvider` 라는 코드가 하드코딩 되어있습니다.
 하지만 이 낡은 커스텀 멀티플렉서(SelectorProvider)가 강제 주입되면 최신 JDK 기반의 Gradle 데몬이 시스템의 로컬 루프백(`localhost` 또는 127.0.0.1 / `::1`)과 통신 소켓을 맺지 못하고 죽어버립니다.
 
+**간헐적 실패 특성 (2026-03-25 추가):**
+- Gradle 데몬 로그 분석 결과, **모든 빌드에서 loopback 에러가 37~41건씩 발생**하고 있으나, Gradle 내부 재시도 로직 덕분에 대부분의 빌드는 성공함.
+- 다만 시스템 자원 부족, 장시간 가동, 또는 네트워크 스택 누적 이슈 등으로 인해 재시도마저 모두 실패하면 빌드가 깨짐.
+- **단순 재부팅으로 해결되는 경우가 많음** — Windows의 네트워크 스택(Winsock/소켓 풀)이 초기화되면서 loopback 연결 성공률이 회복됨.
+- Gradle 데몬 로그 위치: `C:\Users\<사용자명>\.gradle\daemon\8.7\daemon-*.out.log`
+
 **해결 조치:**
+
+**즉시 해결 (간헐적 실패 시):**
+- **PC 재부팅**으로 Windows 네트워크 스택을 초기화하면 대부분 해결됨.
+- Gradle 캐시 정리: `C:\Users\<사용자명>\.gradle\daemon\` 폴더 내 오래된 로그 파일 정리.
+
+**영구 해결 (엔진 패치):**
 임시방편이 아닌 엔진 단에서의 패치를 통해 영구 해결해야 합니다.
 1. **엔진 소스코드 수정**:
    - `[엔진 설치 경로]\Engine\Source\Programs\UnrealBuildTool\Platform\Android\UEDeployAndroid.cs` 파일을 오픈합니다.
@@ -66,3 +78,56 @@ APK 하나에 모든 소스, 에셋 패키지를 함께 내장(Bundle)하여 단
 2. `[/Script/AndroidRuntimeSettings.AndroidRuntimeSettings]` 섹션을 찾습니다.
 3. 해당 섹션에 **`bPackageDataInsideApk=True`** 항목을 추가하고 저장합니다.
 4. 이제부터 결과물은 1.5GB가 넘더라도 문제 하나 없는 튼튼한 단일 `.apk` 로 도출됩니다. OBB 아카이브를 찾지 않으므로 에러도 즉각 해결됩니다.
+
+---
+
+## 🛑 에러 4: OpenGL ES 3.1 셰이더 컴파일 무한 루프 (Sampler 초과)
+
+> **추가일: 2026-03-25**
+
+**에러 증상:**
+- 안드로이드 빌드의 **쿠킹(Cook)** 단계에서 셰이더 컴파일이 끝나지 않고 무한히 지속됨.
+- `UbaController` 로그에 `Task Status -- Queued: 0 -- Active: 2 local` 등의 메시지가 계속 반복 출력되며 진행이 멈춤.
+- 로그에 다음과 같은 경고/에러가 나타남:
+  ```
+  shader uses 22 samplers exceeding the limit of 16
+  shader uses 23 samplers exceeding the limit of 16
+  Failed to compile Material M_MetaHumanSkin_Simplified for platform GLSL_ES3_1_ANDROID
+  Missing cached shadermap for MI_HeadSynthesized_Simplified_LOD1 in OPENGL_ES3_1_ANDROID
+  ```
+- `Missing cached shadermap` 메시지가 여러 머티리얼(MetaHuman 스킨, Paragon 캐릭터 등)에 대해 Low/Medium/High 등 다양한 Quality Level별로 반복 출력됨.
+
+**원인 분석:**
+MetaHuman, Paragon 등 데스크톱 PC용으로 설계된 복잡한 머티리얼이 OpenGL ES 3.1 타겟으로 셰이더를 컴파일할 때 **텍스처 sampler 한도(16개)를 초과**(22~23개 사용)하여 컴파일에 실패합니다. 쿠커는 실패한 머티리얼의 다양한 permutation(LOD별, Scalability Quality별)을 계속 시도하면서 사실상 무한 루프에 빠집니다.
+
+이 문제는 `DefaultEngine.ini`에서 `bBuildForES31=True`와 `bBuildForVulkan=True`가 동시에 활성화되어 있을 때, **Vulkan과 OpenGL ES 3.1 양쪽 모두에 대해 셰이더를 컴파일**하면서 발생합니다. Vulkan은 sampler 한도가 128개 이상이라 문제없지만, OpenGL ES 3.1은 16개 제한에 걸립니다.
+
+**관련 설정 충돌:**
+- `Config\DefaultEngine.ini` → `bBuildForES31=True` (문제의 원인)
+- `Config\Android\AndroidEngine.ini` → `bBuildForES31=False` (오버라이드 의도였으나 적용되지 않음)
+- Android 플랫폼 전용 ini 오버라이드(`Config\Android\AndroidEngine.ini`)에서 `bBuildForES31=False`로 설정해도, `DefaultEngine.ini`의 값이 우선 적용되는 경우가 있음.
+
+**해결 조치:**
+1. **`Config\DefaultEngine.ini`에서 직접 수정** (가장 확실):
+   ```ini
+   [/Script/AndroidRuntimeSettings.AndroidRuntimeSettings]
+   bBuildForES31=False
+   bBuildForVulkan=True
+   ```
+   - `bBuildForES31=True` → `False`로 변경하면, Vulkan 전용으로 셰이더를 컴파일하여 sampler 한도 문제가 해결됨.
+   - 최신 안드로이드 기기의 대부분은 Vulkan을 지원하므로, ES3.1을 비활성화해도 호환성 문제가 거의 없음.
+
+2. **쿠킹 캐시 초기화**:
+   - 셰이더 컴파일 캐시가 오염될 수 있으므로, 설정 변경 후 다음 폴더들을 삭제하고 재빌드:
+     - `Saved\Cooked\Android\`
+     - `Intermediate\` (필요 시)
+     - `Saved\Shaders\` (셰이더 디버그 정보)
+
+3. **(선택) 불필요한 콘텐츠 제외**:
+   - 모바일 빌드에서 MetaHuman(Kellan)이나 Paragon 캐릭터(TwinBlast, Shinbi)를 사용하지 않는다면, `DefaultGame.ini`의 패키징 설정에서 해당 콘텐츠 디렉토리를 제외하면 빌드 시간도 크게 단축됨.
+
+**확인 방법:**
+빌드 로그에서 다음을 확인하여 ES3.1이 비활성화되었는지 검증:
+- `bBuildForES31: false` 로그 출력 확인
+- 셰이더 라이브러리에 `GLSL_ES3_1_ANDROID` 관련 항목이 없어야 정상
+- `SF_VULKAN_ES31_ANDROID` 셰이더 라이브러리만 생성되면 정상

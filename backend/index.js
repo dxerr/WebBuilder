@@ -78,6 +78,12 @@ function getSentrySymbolPath(projectRoot, projectName, platform) {
       if (fs.existsSync(symDir)) return { symbolPath: symDir, description: 'Win64 .pdb symbols' };
       return null;
     }
+    case 'Win64Server': {
+      // 데디케이티드 서버 빌드 산출물 (.pdb 파일) — UBT 결과는 Win64 바이너리 폴더 공유
+      const symDir = path.join(projectRoot, 'Binaries', 'Win64');
+      if (fs.existsSync(symDir)) return { symbolPath: symDir, description: 'Win64 DedicatedServer .pdb symbols' };
+      return null;
+    }
     case 'IOS': {
       // iOS dSYM 심볼 (향후 확장)
       const symDir = path.join(projectRoot, 'Binaries', 'IOS');
@@ -357,6 +363,20 @@ let pendingBuildContext = null;
 async function executeBuild(ctx) {
   const { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision, cleanBuild, clearCache, cookClean } = ctx;
 
+  // ─── 로그 파일 준비 ────────────────────────────────────────────────────────
+  // 저장 경로: <projectRoot>/Saved/Builds/<platform>/<config>/Log/
+  const logLines = [];  // 빌드 전 과정의 모든 로그를 순서대로 누적
+  const logTimestamp = startTime.toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+  const logDir  = path.join(finalProjectPath, 'Saved', 'Builds', platform, config, 'Log');
+  const logFilePath = path.join(logDir, `build_${logTimestamp}.log`);
+  try { fs.mkdirSync(logDir, { recursive: true }); } catch (_) {}
+
+  // 로그를 화면 broadcast + 파일 버퍼 양쪽에 기록하는 헬퍼
+  function blogLog(type, text) {
+    broadcast({ type, data: text });
+    logLines.push(`[${new Date().toISOString()}] ${text}`);
+  }
+
   // Sentry upload 가능 여부 사전 판정 (스텝 수 결정에 필요)
   const sentryProps   = parseSentryProperties(finalProjectPath);
   const projectName   = getProjectName(finalProjectPath);
@@ -369,26 +389,25 @@ async function executeBuild(ctx) {
 
     // git fetch --all
     broadcast({ type: 'STEP', ...STEPS.GIT_FETCH, buildId });
-    broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_FETCH.step}/${STEPS.GIT_FETCH.total} fetch --all` });
+    blogLog('LOG', `[Git] Step ${STEPS.GIT_FETCH.step}/${STEPS.GIT_FETCH.total} fetch --all`);
     await execAsync(`git -C "${finalProjectPath}" fetch --all`);
-    broadcast({ type: 'LOG',  data: `[Git] fetch complete`});
+    blogLog('LOG', `[Git] fetch complete`);
     if (isCancelling) throw new Error('Canceled during git fetch');
 
     if (gitRevision) {
       // STEP 3/5 - checkout specified revision
       broadcast({ type: 'STEP', ...STEPS.GIT_SWITCH, buildId });
-      broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_SWITCH.step}/${STEPS.GIT_SWITCH.total} checkout: ${gitRevision}` });
+      blogLog('LOG', `[Git] Step ${STEPS.GIT_SWITCH.step}/${STEPS.GIT_SWITCH.total} checkout: ${gitRevision}`);
       const { stdout: localList } = await execAsync(`git -C "${finalProjectPath}" branch --list "${gitRevision}"`);
       const isLocalBranch = localList.trim().length > 0;
       const { stdout: remoteList } = await execAsync(`git -C "${finalProjectPath}" branch -r --list "origin/${gitRevision}"`);
       const isRemoteOnly = !isLocalBranch && remoteList.trim().length > 0;
       if (isRemoteOnly) {
         await execAsync(`git -C "${finalProjectPath}" checkout -B "${gitRevision}" --track "origin/${gitRevision}"`);
-        broadcast({ type: 'LOG', data: `[Git] 리모트 전용 브랜치 로컬 트래킹 checkout: ${gitRevision}` });
+        blogLog('LOG', `[Git] 리모트 전용 브랜치 로컬 트래킹 checkout: ${gitRevision}`);
       } else {
         await execAsync(`git -C "${finalProjectPath}" checkout ${gitRevision}`);
-        broadcast({ type: 'LOG', data: `[Git] checkout 완료` });
-
+        blogLog('LOG', `[Git] checkout 완료`);
       }
       if (isCancelling) throw new Error('Canceled during git checkout');
 
@@ -396,18 +415,18 @@ async function executeBuild(ctx) {
       const isBranch = await isBranchName(finalProjectPath, gitRevision);
       if (isBranch) {
         broadcast({ type: 'STEP', ...STEPS.GIT_PULL, buildId });
-        broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_PULL.step}/${STEPS.GIT_PULL.total} pull (branch: ${gitRevision})` });
+        blogLog('LOG', `[Git] Step ${STEPS.GIT_PULL.step}/${STEPS.GIT_PULL.total} pull (branch: ${gitRevision})`);
         await execAsync(`git -C "${finalProjectPath}" pull`);
-        broadcast({ type: 'LOG',  data: `[Git] pull done` });
+        blogLog('LOG', `[Git] pull done`);
         if (isCancelling) throw new Error('Canceled during git pull');
       } else {
-        broadcast({ type: 'LOG', data: `[Git] Step 4/5 pull skip (detached HEAD / tag)` });
+        blogLog('LOG', `[Git] Step 4/5 pull skip (detached HEAD / tag)`);
       }
 
     } else {
       // HEAD mode: no checkout, but still fetch+pull current branch for latest commits
       broadcast({ type: 'STEP', ...STEPS.GIT_SWITCH, buildId });
-      broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_SWITCH.step}/${STEPS.GIT_SWITCH.total} HEAD (checkout 생략, 현재 브랜치 연결 유지)` });
+      blogLog('LOG', `[Git] Step ${STEPS.GIT_SWITCH.step}/${STEPS.GIT_SWITCH.total} HEAD (checkout 생략, 현재 브랜치 연결 유지)`);
 
       let currentBranch = '';
       try {
@@ -417,12 +436,12 @@ async function executeBuild(ctx) {
 
       if (currentBranch && currentBranch !== 'HEAD') {
         broadcast({ type: 'STEP', ...STEPS.GIT_PULL, buildId });
-        broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_PULL.step}/${STEPS.GIT_PULL.total} pull (branch: ${currentBranch})` });
+        blogLog('LOG', `[Git] Step ${STEPS.GIT_PULL.step}/${STEPS.GIT_PULL.total} pull (branch: ${currentBranch})`);
         await execAsync(`git -C "${finalProjectPath}" pull`);
-        broadcast({ type: 'LOG',  data: `[Git] pull done` });
+        blogLog('LOG', `[Git] pull done`);
         if (isCancelling) throw new Error('Canceled during git pull');
       } else {
-        broadcast({ type: 'LOG', data: `[Git] Step 4/5 pull skip (detached HEAD)` });
+        blogLog('LOG', `[Git] Step 4/5 pull skip (detached HEAD)`);
       }
     }
 
@@ -430,70 +449,66 @@ async function executeBuild(ctx) {
     {
       const { stdout: headSha } = await execAsync(`git -C "${finalProjectPath}" rev-parse --short HEAD`);
       const { stdout: headMsg } = await execAsync(`git -C "${finalProjectPath}" log -1 --pretty=format:"%s"`);
-      broadcast({ type: 'LOG',      data: `[Git] Latest commit HEAD: ${headSha.trim()} "${headMsg.trim()}""` });
+      blogLog('LOG', `[Git] Latest commit HEAD: ${headSha.trim()} "${headMsg.trim()}""`);
       broadcast({ type: 'GIT_DONE', buildId });
     }
     // -- PHASE 1.5: Clear Cache (optional) --
     if (clearCache) {
       broadcast({ type: 'STEP', ...STEPS.CLEAR_CACHE, buildId });
-      broadcast({ type: 'LOG', data: `[Clean] Step ${STEPS.CLEAR_CACHE.step}/${STEPS.CLEAR_CACHE.total} Clearing build cache and intermediate files...` });
-      broadcast({ type: 'LOG', data: `[Clean] Target: ${finalProjectPath}` });
-      const fs = require('fs');
-      const pathLib = require('path');
+      blogLog('LOG', `[Clean] Step ${STEPS.CLEAR_CACHE.step}/${STEPS.CLEAR_CACHE.total} Clearing build cache and intermediate files...`);
+      blogLog('LOG', `[Clean] Target: ${finalProjectPath}`);
       // XmlConfigCache.bin 삭제
-      const xmlCache = pathLib.join(finalProjectPath, 'Intermediate', 'Build', 'XmlConfigCache.bin');
+      const xmlCache = path.join(finalProjectPath, 'Intermediate', 'Build', 'XmlConfigCache.bin');
       if (fs.existsSync(xmlCache)) {
         fs.unlinkSync(xmlCache);
-        broadcast({ type: 'LOG', data: `[Clean] Removed: XmlConfigCache.bin` });
+        blogLog('LOG', `[Clean] Removed: XmlConfigCache.bin`);
       }
       // Intermediate, Saved, Binaries 폴더 삭제
       const foldersToClean = ['Intermediate', 'Saved', 'Binaries'];
       for (const folder of foldersToClean) {
-        const folderPath = pathLib.join(finalProjectPath, folder);
+        const folderPath = path.join(finalProjectPath, folder);
         if (fs.existsSync(folderPath)) {
           try {
             fs.rmSync(folderPath, { recursive: true, force: true });
-            broadcast({ type: 'LOG', data: `[Clean] Removed: ${folder}/` });
+            blogLog('LOG', `[Clean] Removed: ${folder}/`);
           } catch (e) {
-            broadcast({ type: 'LOG', data: `[Clean] Warning: Could not fully remove ${folder}/ - ${e.message}` });
+            blogLog('LOG', `[Clean] Warning: Could not fully remove ${folder}/ - ${e.message}`);
           }
         }
       }
-      broadcast({ type: 'LOG', data: `[Clean] Cache cleared successfully` });
+      blogLog('LOG', `[Clean] Cache cleared successfully`);
     }
     if (isCancelling) throw new Error('Canceled during cache clear');
 
     // -- PHASE 1.6: Cook Clean (optional) -- 셰이더·에셋 쿠킹 캐시만 삭제 (C++ 빌드 생략)
     if (cookClean) {
       broadcast({ type: 'STEP', ...STEPS.COOK_CLEAN, buildId });
-      broadcast({ type: 'LOG', data: `[CookClean] Step ${STEPS.COOK_CLEAN.step}/${STEPS.COOK_CLEAN.total} Clearing cooked asset & shader cache...` });
-      broadcast({ type: 'LOG', data: `[CookClean] Target: ${finalProjectPath}` });
-      const fsCC   = require('fs');
-      const pathCC = require('path');
+      blogLog('LOG', `[CookClean] Step ${STEPS.COOK_CLEAN.step}/${STEPS.COOK_CLEAN.total} Clearing cooked asset & shader cache...`);
+      blogLog('LOG', `[CookClean] Target: ${finalProjectPath}`);
       const cookDirs = [
-        pathCC.join(finalProjectPath, 'Saved', 'Cooked'),
-        pathCC.join(finalProjectPath, 'Saved', 'ShaderDebugInfo'),
-        pathCC.join(finalProjectPath, 'DerivedDataCache'),
+        path.join(finalProjectPath, 'Saved', 'Cooked'),
+        path.join(finalProjectPath, 'Saved', 'ShaderDebugInfo'),
+        path.join(finalProjectPath, 'DerivedDataCache'),
       ];
       for (const dir of cookDirs) {
-        if (fsCC.existsSync(dir)) {
+        if (fs.existsSync(dir)) {
           try {
-            fsCC.rmSync(dir, { recursive: true, force: true });
-            broadcast({ type: 'LOG', data: `[CookClean] Removed: ${dir}` });
+            fs.rmSync(dir, { recursive: true, force: true });
+            blogLog('LOG', `[CookClean] Removed: ${dir}`);
           } catch (e) {
-            broadcast({ type: 'LOG', data: `[CookClean] Warning: ${dir} — ${e.message}` });
+            blogLog('LOG', `[CookClean] Warning: ${dir} — ${e.message}`);
           }
         } else {
-          broadcast({ type: 'LOG', data: `[CookClean] Skip (not found): ${dir}` });
+          blogLog('LOG', `[CookClean] Skip (not found): ${dir}`);
         }
       }
-      broadcast({ type: 'LOG', data: `[CookClean] Cook cache cleared. UAT will recook all shaders & assets.` });
+      blogLog('LOG', `[CookClean] Cook cache cleared. UAT will recook all shaders & assets.`);
     }
     if (isCancelling) throw new Error('Canceled during cook clean');
 
     // PHASE 2: 빌드 명령줄 조립 및 서브프로세스 런처 진입
     broadcast({ type: 'STEP', ...STEPS.BUILD_START, buildId });
-    broadcast({ type: 'LOG',  data: `[Build] Step ${STEPS.BUILD_START.step}/${STEPS.BUILD_START.total} BAT run (${platform} / ${config})${cleanBuild ? ' [Clean Build]' : ''}${cookClean ? ' [Cook Clean]' : ''}` });
+    blogLog('LOG', `[Build] Step ${STEPS.BUILD_START.step}/${STEPS.BUILD_START.total} BAT run (${platform} / ${config})${cleanBuild ? ' [Clean Build]' : ''}${cookClean ? ' [Cook Clean]' : ''}`);
 
     const batEnv        = {
       ...process.env,
@@ -510,8 +525,8 @@ async function executeBuild(ctx) {
     const actualBatPath = finalProjectPath ? path.join(finalProjectPath, 'BuildProject.bat') : BAT_SCRIPT_PATH;
 
     const batArgs = ['/c', actualBatPath, platform, config];
-    if (cleanBuild)   batArgs.push('-clean');
-    if (cookClean)    batArgs.push('-cookclean');
+    if (cleanBuild)                           batArgs.push('-clean');
+    if (cookClean && platform !== 'Win64Server') batArgs.push('-cookclean'); // 서버 빌드는 cook 단계 없음
 
     activeBuildProcess = spawn('cmd.exe', batArgs, {
       cwd: finalProjectPath ? finalProjectPath : path.dirname(BAT_SCRIPT_PATH),
@@ -522,6 +537,7 @@ async function executeBuild(ctx) {
     activeBuildProcess.stdout.on('data', (d) => {
       const txt = d.toString('utf8');
       broadcast({ type: 'LOG', data: txt });
+      logLines.push(txt.trimEnd());
       const lines = txt.trim().split('\n').filter(Boolean);
       const errLine = lines.find(l => /error|failed|exception/i.test(l) && !/^using |^running |^log file|^total/i.test(l));
       if (errLine) lastErrorLine = errLine.trim();
@@ -529,6 +545,7 @@ async function executeBuild(ctx) {
     activeBuildProcess.stderr.on('data', (d) => {
       const txt = d.toString('utf8');
       broadcast({ type: 'LOG_ERROR', data: txt });
+      logLines.push(`[STDERR] ${txt.trimEnd()}`);
       const lines = txt.trim().split('\n').filter(Boolean);
       if (lines.length > 0) lastErrorLine = lines[lines.length - 1].trim();
     });
@@ -546,20 +563,70 @@ async function executeBuild(ctx) {
         archivePath = path.join(base, 'Saved', 'Builds', platform, config);
       }
 
+      // ─── Win64Server 후처리: 바이너리 → Saved/Builds 아카이브 복사 ───────
+      // UAT를 거치지 않아 Stage/Archive 단계가 없으므로 수동으로 복사
+      if (status === 'Success' && platform === 'Win64Server') {
+        try {
+          const base        = finalProjectPath || path.dirname(BAT_SCRIPT_PATH);
+          const srcDir      = path.join(base, 'Binaries', 'Win64');
+          const destDir     = path.join(base, 'Saved', 'Builds', platform, config);
+          const projectName = getProjectName(base) || 'ExFrameWork';
+
+          fs.mkdirSync(destDir, { recursive: true });
+
+          // 복사 대상: Server 실행파일 + 필수 런타임 dll
+          const copyTargets = [
+            `${projectName}Server.exe`,
+            `${projectName}Server.pdb`,
+            `${projectName}Server.target`,
+            'tbb12.dll',
+            'tbbmalloc.dll',
+          ];
+
+          let copiedCount = 0;
+          for (const fileName of copyTargets) {
+            const src  = path.join(srcDir, fileName);
+            const dest = path.join(destDir, fileName);
+            if (fs.existsSync(src)) {
+              fs.copyFileSync(src, dest);
+              blogLog('LOG', `[ServerArchive] Copied: ${fileName}`);
+              copiedCount++;
+            }
+          }
+
+          // 런처 .bat 생성
+          // ExFrameWorkServer.exe는 상대경로(../../../)로 .uproject를 탐색하므로
+          // 반드시 Binaries\Win64\ 를 작업 디렉토리로 설정해야 함
+          const shortcutBat = path.join(destDir, `Run_${projectName}Server.bat`);
+          const binDir = path.join(base, 'Binaries', 'Win64');
+          const shortcutContent = [
+            `@echo off`,
+            `cd /d "${binDir}"`,
+            `start "" "${projectName}Server.exe" -log -port=7777`,
+          ].join('\r\n');
+          fs.writeFileSync(shortcutBat, shortcutContent, 'utf8');
+          blogLog('LOG', `[ServerArchive] Created launcher: Run_${projectName}Server.bat`);
+
+          blogLog('LOG', `[ServerArchive] ✅ ${copiedCount} files archived to: ${destDir}`);
+        } catch (archiveErr) {
+          blogLog('LOG', `[ServerArchive] ⚠️ Archive copy failed: ${archiveErr.message}`);
+        }
+      }
+
       // ─── Sentry Symbol Upload (빌드 성공 시에만) ───
       let sentryStatus = null;
       if (status === 'Success' && hasSentry && STEPS.SENTRY_UPLOAD) {
         broadcast({ type: 'STEP', ...STEPS.SENTRY_UPLOAD, buildId });
-        broadcast({ type: 'LOG',  data: `[Sentry] Step ${STEPS.SENTRY_UPLOAD.step}/${STEPS.SENTRY_UPLOAD.total} Debug symbol upload starting...` });
-        broadcast({ type: 'LOG',  data: `[Sentry] CLI: ${sentryCli}` });
-        broadcast({ type: 'LOG',  data: `[Sentry] Org: ${sentryProps.org} / Project: ${sentryProps.project}` });
+        blogLog('LOG', `[Sentry] Step ${STEPS.SENTRY_UPLOAD.step}/${STEPS.SENTRY_UPLOAD.total} Debug symbol upload starting...`);
+        blogLog('LOG', `[Sentry] CLI: ${sentryCli}`);
+        blogLog('LOG', `[Sentry] Org: ${sentryProps.org} / Project: ${sentryProps.project}`);
 
         const symbolInfo = getSentrySymbolPath(finalProjectPath, projectName, platform);
         if (!symbolInfo) {
-          broadcast({ type: 'LOG',  data: `[Sentry] ⚠️ Symbol path not found for platform: ${platform} — skipping upload` });
+          blogLog('LOG', `[Sentry] ⚠️ Symbol path not found for platform: ${platform} — skipping upload`);
           sentryStatus = 'skipped';
         } else {
-          broadcast({ type: 'LOG',  data: `[Sentry] Symbol target: ${symbolInfo.symbolPath} (${symbolInfo.description})` });
+          blogLog('LOG', `[Sentry] Symbol target: ${symbolInfo.symbolPath} (${symbolInfo.description})`);
           try {
             const sentryResult = await new Promise((resolve, reject) => {
               const sentryProc = spawn(sentryCli, [
@@ -579,30 +646,143 @@ async function executeBuild(ctx) {
               });
               sentryProc.stderr.on('data', (d) => {
                 const txt = d.toString('utf8').trim();
-                if (txt) broadcast({ type: 'LOG_ERROR', data: `[Sentry] ${txt}` });
+                if (txt) { broadcast({ type: 'LOG_ERROR', data: `[Sentry] ${txt}` }); logLines.push(`[STDERR] [Sentry] ${txt}`); }
               });
               sentryProc.on('close', (sentryCode) => resolve(sentryCode));
               sentryProc.on('error', (err) => reject(err));
             });
 
             if (sentryResult === 0) {
-              broadcast({ type: 'LOG', data: `[Sentry] ✅ Debug symbols uploaded successfully` });
+              blogLog('LOG', `[Sentry] ✅ Debug symbols uploaded successfully`);
               sentryStatus = 'success';
             } else {
-              broadcast({ type: 'LOG_ERROR', data: `[Sentry] ❌ Upload failed with exit code ${sentryResult}` });
+              blogLog('LOG_ERROR', `[Sentry] ❌ Upload failed with exit code ${sentryResult}`);
               sentryStatus = 'failed';
             }
           } catch (sentryErr) {
-            broadcast({ type: 'LOG_ERROR', data: `[Sentry] ❌ Error: ${sentryErr.message}` });
+            blogLog('LOG_ERROR', `[Sentry] ❌ Error: ${sentryErr.message}`);
             sentryStatus = 'failed';
           }
         }
       } else if (status === 'Success' && !hasSentry) {
-        broadcast({ type: 'LOG', data: `[Sentry] sentry.properties 또는 sentry-cli를 찾을 수 없음 — upload 생략` });
+        blogLog('LOG', `[Sentry] sentry.properties 또는 sentry-cli를 찾을 수 없음 — upload 생략`);
       }
 
-      db.prepare('UPDATE builds SET status = ?, end_time = ?, duration_seconds = ? WHERE id = ?')
-        .run(status, endTime.toISOString(), durationSeconds, buildId);
+      // ─── 로그 파일 저장 ────────────────────────────────────────────────────
+      let savedLogFile = null;
+      try {
+        // Clear Cache 후 Saved/ 가 재생성될 수 있으므로 파일 쓰기 직전 디렉터리 재확인
+        fs.mkdirSync(logDir, { recursive: true });
+        const header = [
+          `========================================`,
+          `  UE Web Builder - Build Log`,
+          `  BuildID   : ${buildId}`,
+          `  Platform  : ${platform}`,
+          `  Config    : ${config}`,
+          `  Status    : ${status}`,
+          `  StartTime : ${startTime.toISOString()}`,
+          `  EndTime   : ${endTime.toISOString()}`,
+          `  Duration  : ${durationSeconds}s`,
+          `========================================`,
+          '',
+        ].join('\n');
+        fs.writeFileSync(logFilePath, header + logLines.join('\n'), 'utf8');
+        savedLogFile = logFilePath;
+        broadcast({ type: 'LOG', data: `[WebBuilder] 📄 Log saved: ${logFilePath}` });
+      } catch (writeErr) {
+        broadcast({ type: 'LOG', data: `[WebBuilder] ⚠️ Log write failed: ${writeErr.message}` });
+      }
+
+      // ─── Issue 파일 생성 (Warning/Error 필터링 후 중복 제거) ──────────────
+      try {
+        const issueDir = path.join(finalProjectPath, 'Saved', 'Builds', platform, config, 'Issue');
+        const issueFilePath = path.join(issueDir, `issue_${logTimestamp}.md`);
+        fs.mkdirSync(issueDir, { recursive: true });
+
+        const allLogText = logLines.join('\n');
+        const rawLines = allLogText.split('\n');
+
+        // UE가 자체 생성하는 "Warning/Error Summary" 섹션 라인은 원본의 중복이므로 제외
+        // 해당 섹션: "LogInit: Display: Warning/Error Summary" ~ "LogInit: Display: Success - X error(s)"
+        let inSummarySection = false;
+        const filteredLines = [];
+        for (const line of rawLines) {
+          if (/Warning\/Error Summary/i.test(line) && /LogInit.*Display/i.test(line)) {
+            inSummarySection = true;
+          }
+          if (!inSummarySection) filteredLines.push(line);
+          if (inSummarySection && /Success\s*-\s*\d+\s*error\(s\)/i.test(line)) {
+            inSummarySection = false;
+          }
+        }
+
+        // Warning / Error 라인 분류
+        const warnings = [];
+        const errors   = [];
+        const seenWarnings = new Set();
+        const seenErrors   = new Set();
+
+        for (const line of filteredLines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+
+          const isWarning = /: Warning:/i.test(trimmed) || /^Warning:/i.test(trimmed);
+          // Error 판정: ": Error:" 패턴 포함, 단 "0 error(s)" 같은 요약 카운트 라인은 제외
+          const isError = (
+            /: Error:/i.test(trimmed) || /^Error:/i.test(trimmed)
+          ) && !/\d+\s*error\(s\)/i.test(trimmed);
+
+          if (isWarning) {
+            // 정규화 키: 타임스탬프([...]) 및 앞 공백 제거 후 dedup
+            const key = trimmed.replace(/^\[[\d.,: -]+\]\s*/, '').replace(/^\[[\d]+\]\s*/, '');
+            if (!seenWarnings.has(key)) {
+              seenWarnings.add(key);
+              warnings.push(trimmed);
+            }
+          } else if (isError) {
+            const key = trimmed.replace(/^\[[\d.,: -]+\]\s*/, '').replace(/^\[[\d]+\]\s*/, '');
+            if (!seenErrors.has(key)) {
+              seenErrors.add(key);
+              errors.push(trimmed);
+            }
+          }
+        }
+
+        const issueHeader = [
+          `# Build Issue Report`,
+          ``,
+          `| 항목       | 내용 |`,
+          `|------------|------|`,
+          `| BuildID    | ${buildId} |`,
+          `| Platform   | ${platform} |`,
+          `| Config     | ${config} |`,
+          `| Status     | ${status} |`,
+          `| StartTime  | ${startTime.toISOString()} |`,
+          `| EndTime    | ${endTime.toISOString()} |`,
+          `| Duration   | ${durationSeconds}s |`,
+          `| Errors     | ${errors.length} |`,
+          `| Warnings   | ${warnings.length} |`,
+          ``,
+          `---`,
+          ``,
+        ].join('\n');
+
+        const errorSection = errors.length > 0
+          ? `## Errors (${errors.length})\n\n` + errors.map(l => `- \`${l}\``).join('\n') + '\n\n'
+          : `## Errors\n\n_없음_\n\n`;
+
+        const warningSection = warnings.length > 0
+          ? `## Warnings (${warnings.length})\n\n` + warnings.map(l => `- \`${l}\``).join('\n') + '\n'
+          : `## Warnings\n\n_없음_\n`;
+
+        fs.writeFileSync(issueFilePath, issueHeader + errorSection + warningSection, 'utf8');
+        broadcast({ type: 'LOG', data: `[WebBuilder] 🔍 Issue report saved: ${issueFilePath} (${errors.length} errors, ${warnings.length} warnings)` });
+      } catch (issueErr) {
+        broadcast({ type: 'LOG', data: `[WebBuilder] ⚠️ Issue file write failed: ${issueErr.message}` });
+      }
+
+      db.prepare('UPDATE builds SET status = ?, end_time = ?, duration_seconds = ?, log_file = ? WHERE id = ?')
+        .run(status, endTime.toISOString(), durationSeconds, savedLogFile, buildId);
 
       broadcast({
         type:        'STATUS',
@@ -628,10 +808,16 @@ async function executeBuild(ctx) {
     activeBuildId       = null;
     isCancelling        = false;
     pendingBuildContext = null;
+    logLines.push(`[ERROR] ${err.message}`);
+    // 예외 발생 시에도 그때까지 쌓인 로그는 저장
+    try {
+      fs.mkdirSync(logDir, { recursive: true });
+      fs.writeFileSync(logFilePath, logLines.join('\n'), 'utf8');
+    } catch (_) {}
     broadcast({ type: 'LOG_ERROR', data: `[Error] ${err.message}` });
     broadcast({ type: 'STATUS',    data: 'Build Failed', buildId });
-    db.prepare('UPDATE builds SET status = ?, end_time = ? WHERE id = ?')
-      .run('Failed', new Date().toISOString(), buildId);
+    db.prepare('UPDATE builds SET status = ?, end_time = ?, log_file = ? WHERE id = ?')
+      .run('Failed', new Date().toISOString(), logFilePath, buildId);
   }
 }
 
