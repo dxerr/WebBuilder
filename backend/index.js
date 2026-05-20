@@ -416,7 +416,8 @@ async function executeBuild(ctx) {
       if (isBranch) {
         broadcast({ type: 'STEP', ...STEPS.GIT_PULL, buildId });
         blogLog('LOG', `[Git] Step ${STEPS.GIT_PULL.step}/${STEPS.GIT_PULL.total} pull (branch: ${gitRevision})`);
-        await execAsync(`git -C "${finalProjectPath}" pull`);
+        await execAsync(`git -C "${finalProjectPath}" merge --abort`).catch(() => {});
+        await execAsync(`git -C "${finalProjectPath}" reset --hard origin/${gitRevision}`);
         blogLog('LOG', `[Git] pull done`);
         if (isCancelling) throw new Error('Canceled during git pull');
       } else {
@@ -437,7 +438,8 @@ async function executeBuild(ctx) {
       if (currentBranch && currentBranch !== 'HEAD') {
         broadcast({ type: 'STEP', ...STEPS.GIT_PULL, buildId });
         blogLog('LOG', `[Git] Step ${STEPS.GIT_PULL.step}/${STEPS.GIT_PULL.total} pull (branch: ${currentBranch})`);
-        await execAsync(`git -C "${finalProjectPath}" pull`);
+        await execAsync(`git -C "${finalProjectPath}" merge --abort`).catch(() => {});
+        await execAsync(`git -C "${finalProjectPath}" reset --hard origin/${currentBranch}`);
         blogLog('LOG', `[Git] pull done`);
         if (isCancelling) throw new Error('Canceled during git pull');
       } else {
@@ -535,7 +537,7 @@ async function executeBuild(ctx) {
     isPreparingBuild = false;
 
     activeBuildProcess.stdout.on('data', (d) => {
-      const txt = d.toString('utf8');
+      const txt = iconv.decode(d, 'cp949');
       broadcast({ type: 'LOG', data: txt });
       logLines.push(txt.trimEnd());
       const lines = txt.trim().split('\n').filter(Boolean);
@@ -543,7 +545,7 @@ async function executeBuild(ctx) {
       if (errLine) lastErrorLine = errLine.trim();
     });
     activeBuildProcess.stderr.on('data', (d) => {
-      const txt = d.toString('utf8');
+      const txt = iconv.decode(d, 'cp949');
       broadcast({ type: 'LOG_ERROR', data: txt });
       logLines.push(`[STDERR] ${txt.trimEnd()}`);
       const lines = txt.trim().split('\n').filter(Boolean);
@@ -894,7 +896,7 @@ app.post('/api/build/confirm', async (req, res) => {
 
   try {
     broadcast({ type: 'LOG', data: '[Git] Revert 餓?.. 筌뤴뫀諭?嚥≪뮇類?癰궰野껋럩沅' });
-    await execAsync(`git -C "${ctx.finalProjectPath}" checkout -- .`);
+    await execAsync(`git -C "${ctx.finalProjectPath}" reset --hard HEAD`);
     broadcast({ type: 'LOG', data: '[Git] Revert 완료. 기존 빌드 프로세스 지속' });
     await executeBuild(ctx);
   } catch (err) {
