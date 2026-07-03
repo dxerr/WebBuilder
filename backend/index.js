@@ -121,7 +121,8 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const PORT = 3001;
-const BAT_SCRIPT_PATH = 'F:\\wz\\UE_CICD\\SampleProject\\BuildProject.bat';
+// BuildProject.bat 경로는 빌드 요청 시 UI의 "Project Directory Path (.uproject location)"
+// 값(projectPath)에서 유도된다: <projectPath>\BuildProject.bat
 
 // Initialize SQLite DB for Analytics & History
 const db = new Database('build_history.db');
@@ -140,17 +141,95 @@ db.exec(`
 
 // WebSocket connections
 const clients = new Set();
+
+// ─── 빌드 상태 스냅샷 (새 연결 시 SYNC 전송용) ───────────────────────────
+// MCP 또는 다른 클라이언트가 빌드를 시작했을 때 웹 UI가 나중에 열려도
+// 현재 진행 상태를 즉시 복원할 수 있도록 메모리에 유지한다.
+let buildState = {
+  isBuilding:    false,
+  buildId:       null,
+  platform:      null,
+  config:        null,
+  currentStep:   null,   // { step, total, label }
+  stepLabels:    [],     // [{ step, label, isDanger, isCookClean, isSentry }]
+  recentLogs:    [],     // 최근 300줄 (새 연결 시 재생)
+  buildStatus:   'Idle',
+  revertConfirm: null,   // { buildId, files } — Revert 대기 중일 때
+};
+
+function syncClient(ws) {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: 'SYNC', state: buildState }));
+}
+
 wss.on('connection', (ws) => {
   clients.add(ws);
+  // 새 클라이언트에게 현재 빌드 상태 즉시 전송
+  syncClient(ws);
   ws.on('close', () => clients.delete(ws));
 });
 
 function broadcast(data) {
+  // 상태 스냅샷 업데이트
+  if (data.type === 'STEP') {
+    buildState.isBuilding  = true;
+    buildState.buildId     = data.buildId || buildState.buildId;
+    buildState.currentStep = { step: data.step, total: data.total, label: data.label };
+    buildState.buildStatus = data.label;
+    const exists = buildState.stepLabels.find(s => s.step === data.step);
+    if (!exists) {
+      buildState.stepLabels.push({
+        step:        data.step,
+        label:       data.label,
+        isDanger:    data.label === 'Clear Cache',
+        isCookClean: data.label === 'Cook Clean',
+        isSentry:    data.label === 'Sentry Upload',
+      });
+      buildState.stepLabels.sort((a, b) => a.step - b.step);
+    }
+  } else if (data.type === 'LOG' || data.type === 'LOG_ERROR') {
+    const txt = (data.data || '').trim();
+    if (txt) {
+      buildState.recentLogs = [...buildState.recentLogs.slice(-299), txt];
+    }
+  } else if (data.type === 'GIT_DONE') {
+    buildState.buildStatus = 'Git Done — Launching Build...';
+  } else if (data.type === 'CONFIRM_REVERT') {
+    buildState.buildStatus = 'Waiting for confirmation...';
+    buildState.revertConfirm = { buildId: data.buildId, files: data.files };
+  } else if (data.type === 'STATUS') {
+    buildState.buildStatus   = data.data;
+    buildState.revertConfirm = null;
+    if (data.data.includes('Success') || data.data.includes('Failed') || data.data.includes('Canceled')) {
+      buildState.isBuilding  = false;
+      buildState.currentStep = null;
+    }
+  } else if (data.type === 'BUILD_LOCK_RESET') {
+    buildState.isBuilding  = false;
+    buildState.currentStep = null;
+    buildState.buildStatus = 'Lock auto-reset by server';
+  }
+
   clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify(data));
     }
   });
+}
+
+// 빌드 시작 시 buildState 초기화
+function resetBuildState(buildId, platform, config) {
+  buildState = {
+    isBuilding:    true,
+    buildId,
+    platform,
+    config,
+    currentStep:   null,
+    stepLabels:    [],
+    recentLogs:    [],
+    buildStatus:   'Starting Build...',
+    revertConfirm: null,
+  };
 }
 
 let activeBuildProcess = null;
@@ -190,7 +269,8 @@ setInterval(() => {
 
 // GET /api/git/refs
 app.get('/api/git/refs', async (req, res) => {
-  const repoPath = req.query.path || 'F:\\wz\\UE_CICD\\SampleProject';
+  const repoPath = req.query.path;
+  if (!repoPath) return res.status(400).json({ error: 'path query parameter is required' });
   try {
     // 원격 ref 동기화 (새 브랜치/태그 반영)
     await execAsync(`git -C "${repoPath}" fetch --all --prune`);
@@ -278,7 +358,8 @@ app.get('/api/git/refs', async (req, res) => {
 
 // GET /api/git/commits
 app.get('/api/git/commits', async (req, res) => {
-  const repoPath = req.query.path || 'F:\\wz\\UE_CICD\\SampleProject';
+  const repoPath = req.query.path;
+  if (!repoPath) return res.status(400).json({ error: 'path query parameter is required' });
   const branch = req.query.branch || '';
   try {
     if (repoPath.startsWith('http://') || repoPath.startsWith('https://')) {
@@ -524,14 +605,14 @@ async function executeBuild(ctx) {
       JAVA_HOME:            'C:\\Android\\jdk-17-new',
       _JAVA_OPTIONS:        '-Djava.net.preferIPv4Stack=true',
     };
-    const actualBatPath = finalProjectPath ? path.join(finalProjectPath, 'BuildProject.bat') : BAT_SCRIPT_PATH;
+    const actualBatPath = path.join(finalProjectPath, 'BuildProject.bat');
 
     const batArgs = ['/c', actualBatPath, platform, config];
     if (cleanBuild) batArgs.push('-clean');
     if (cookClean)  batArgs.push('-cookclean');
 
     activeBuildProcess = spawn('cmd.exe', batArgs, {
-      cwd: finalProjectPath ? finalProjectPath : path.dirname(BAT_SCRIPT_PATH),
+      cwd: finalProjectPath,
       env: batEnv
     });
     isPreparingBuild = false;
@@ -561,7 +642,7 @@ async function executeBuild(ctx) {
       // 결과 패키지가 저장된 아카이브 절대 경로 문자열 파싱 (UI 탐색기 연동)
       let archivePath = null;
       if (status === 'Success') {
-        const base = finalProjectPath || path.dirname(BAT_SCRIPT_PATH);
+        const base = finalProjectPath;
         archivePath = path.join(base, 'Saved', 'Builds', platform, config);
       }
 
@@ -570,9 +651,9 @@ async function executeBuild(ctx) {
       // 실행 편의를 위해 -log 플래그 포함 런처 bat만 별도 생성
       if (status === 'Success' && platform === 'Win64Server') {
         try {
-          const base        = finalProjectPath || path.dirname(BAT_SCRIPT_PATH);
+          const base        = finalProjectPath;
           const destDir     = path.join(base, 'Saved', 'Builds', platform, config);
-          const projectName = getProjectName(base) || 'ExFrameWork';
+          const projectName = getProjectName(base) || path.basename(base) || 'UE';
 
           fs.mkdirSync(destDir, { recursive: true });
 
@@ -816,6 +897,10 @@ app.post('/api/build', (req, res) => {
   if (!platform || !config) {
     return res.status(400).json({ error: 'Missing platform or config' });
   }
+  // Engine/Project 경로는 UI 입력(Engine Directory Path / Project Directory Path)에서 반드시 전달되어야 한다.
+  if (!enginePath || !projectPath) {
+    return res.status(400).json({ error: 'Missing enginePath or projectPath (set them in the UI)' });
+  }
 
   const buildId          = uuidv4();
   const startTime        = new Date();
@@ -825,14 +910,18 @@ app.post('/api/build', (req, res) => {
   preparingBuildSince    = Date.now();
   pendingBuildContext    = null;
 
+  // 빌드 상태 스냅샷 초기화 (새 WebSocket 연결 시 즉시 동기화됨)
+  resetBuildState(buildId, platform, config);
+
   db.prepare('INSERT INTO builds (id, platform, config, status, start_time) VALUES (?, ?, ?, ?, ?)')
     .run(buildId, platform, config, 'Running', startTime.toISOString());
   res.json({ message: 'Build triggered', buildId });
 
   (async () => {
     try {
-      const finalEnginePath  = enginePath  || 'F:\\wz\\UE_CICD\\UnrealEngine\\UnrealEngine';
-      const finalProjectPath = projectPath || 'F:\\wz\\UE_CICD\\SampleProject';
+      // UI에서 전달된 경로를 그대로 사용 (핸들러 진입부에서 존재 검증됨)
+      const finalEnginePath  = enginePath;
+      const finalProjectPath = projectPath;
       const ctx = { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision, cleanBuild, clearCache, cookClean };
 
       // Sentry 사전 판정 (Git Check 스텝 total 표시에 필요)

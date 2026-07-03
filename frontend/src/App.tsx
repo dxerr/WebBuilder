@@ -7,6 +7,24 @@ import { motion, AnimatePresence } from 'framer-motion';
 const host = window.location.hostname || 'localhost';
 const WS_URL = `ws://${host}:3001`;
 const API_URL = `http://${host}:3001/api`;
+
+// 사용자가 설정한 경로는 브라우저 localStorage에 보존한다 (소스 하드코딩 대신).
+// 아래 값은 최초 1회용 seed일 뿐 — 필드를 한 번 편집하면 그 값이 저장되어 seed와 무관하게 유지된다.
+// 다른 프로젝트/PC에서는 UI에서 경로를 바꾸면 그대로 브라우저에 남는다.
+const SEED_PATHS: Record<string, string> = {
+  'ue.enginePath':  'F:\\wz\\UE_CICD\\UnrealEngine\\UnrealEngine',
+  'ue.projectPath': 'F:\\wz\\UE_CICD\\SampleProject',
+  'ue.gitRepoPath': 'F:\\wz\\UE_CICD\\SampleProject',
+};
+const loadPath = (key: string) => {
+  try {
+    const stored = localStorage.getItem(key);
+    return stored !== null ? stored : (SEED_PATHS[key] || '');
+  } catch { return SEED_PATHS[key] || ''; }
+};
+const savePath = (key: string, value: string) => {
+  try { localStorage.setItem(key, value); } catch { /* ignore */ }
+};
 const COLORS = ['#38bdf8', '#818cf8', '#34d399', '#f87171'];
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -369,10 +387,15 @@ export default function App() {
   const [platform, setPlatform]     = useState('Win64');
   const [config, setConfig]         = useState('Development');
 
-  const [enginePath, setEnginePath]   = useState('F:\\wz\\UE_CICD\\UnrealEngine\\UnrealEngine');
-  const [projectPath, setProjectPath] = useState('F:\\wz\\UE_CICD\\SampleProject');
-  const [gitRepoPath, setGitRepoPath] = useState('F:\\wz\\UE_CICD\\SampleProject');
+  const [enginePath, setEnginePath]   = useState(() => loadPath('ue.enginePath'));
+  const [projectPath, setProjectPath] = useState(() => loadPath('ue.projectPath'));
+  const [gitRepoPath, setGitRepoPath] = useState(() => loadPath('ue.gitRepoPath'));
   const [gitRevision, setGitRevision] = useState('');
+
+  // 입력한 경로를 브라우저에 자동 저장 → 새로고침/재접속 후에도 유지
+  useEffect(() => { savePath('ue.enginePath', enginePath); }, [enginePath]);
+  useEffect(() => { savePath('ue.projectPath', projectPath); }, [projectPath]);
+  useEffect(() => { savePath('ue.gitRepoPath', gitRepoPath); }, [gitRepoPath]);
 
   const [cleanBuild, setCleanBuild]   = useState(false);
   const [clearCache, setClearCache]     = useState(false);
@@ -395,6 +418,24 @@ export default function App() {
     const ws = new WebSocket(WS_URL);
     ws.onmessage = (event) => {
       const message = JSON.parse(event.data);
+
+      // ── SYNC: 서버에서 현재 빌드 상태 스냅샷 수신 (새 연결 시 또는 MCP로 빌드 시작 후 페이지 열 때)
+      if (message.type === 'SYNC') {
+        const s = message.state;
+        if (s.isBuilding) {
+          setIsBuilding(true);
+          setBuildResult(null);
+          setBuildStatus(s.buildStatus || 'Building...');
+          if (s.currentStep) setBuildStep(s.currentStep);
+          if (s.stepLabels?.length > 0) setBuildStepLabels(s.stepLabels);
+          if (s.recentLogs?.length > 0) setLogs(s.recentLogs);
+          if (s.revertConfirm) setRevertConfirm(s.revertConfirm);
+        } else {
+          setBuildStatus(s.buildStatus || 'Idle');
+        }
+        return;
+      }
+
       if (message.type === 'BUILD_LOCK_RESET') {
         setIsBuildLocked(false);
         setIsBuilding(false);
@@ -459,6 +500,10 @@ export default function App() {
   const fetchAnalytics = async () => { try { const r = await fetch(`${API_URL}/analytics`); setAnalytics(await r.json()); } catch(e){} };
 
   const handleBuild = () => {
+    if (!enginePath.trim() || !projectPath.trim()) {
+      setBuildStatus('Set Engine Directory Path and Project Directory Path first');
+      return;
+    }
     if (clearCache) {
       setClearCacheConfirm(true);
       return;
@@ -627,7 +672,7 @@ export default function App() {
 
       {/* ── Sidebar ── */}
       <nav className="sidebar">
-        <div className="header-title"><TerminalIcon size={28}/><span>ExFrameWork Portal</span></div>
+        <div className="header-title"><TerminalIcon size={28}/><span>UE Web Builder</span></div>
 
         <div className="glass-panel" style={{ padding: '1.5rem', marginTop: '2rem' }}>
           <div className="tabs" style={{ flexDirection: 'column' }}>
