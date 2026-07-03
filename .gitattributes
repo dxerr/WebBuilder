@@ -1,0 +1,4 @@
+# Windows batch scripts must use CRLF, otherwise cmd.exe misparses
+# multi-line for/if blocks and ^ line continuations.
+*.bat text eol=crlf
+*.cmd text eol=crlf

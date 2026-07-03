@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "ue-web-builder": {
+      "command": "node",
+      "args": [
+        "F:\\wz\\UE_CICD\\UE_Web_Builder\\backend\\mcp-server.js"
+      ],
+      "env": {
+        "UE_BACKEND_HOST": "localhost",
+        "UE_BACKEND_PORT": "3001"
+      }
+    }
+  }
+}

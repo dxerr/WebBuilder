@@ -17,6 +17,33 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ─── 빌드 출력 인코딩 처리 ────────────────────────────────────────────────────
+// 빌드 툴 체인은 UTF-8 / CP949(한글 Windows 콘솔)가 섞여 나올 수 있다.
+// 라인 단위로 "엄격 UTF-8 디코딩 시도 → 실패 시 CP949 폴백"하여 어느 쪽이든 올바르게 표시한다.
+// (개행 0x0A는 UTF-8/CP949 멀티바이트 시퀀스 중간에 절대 나오지 않으므로 라인 분할이 문자를 쪼개지 않는다.)
+const _utf8Strict = new TextDecoder('utf-8', { fatal: true });
+function smartDecode(buf) {
+  try { return _utf8Strict.decode(buf); }
+  catch { return iconv.decode(buf, 'cp949'); }
+}
+// data 청크를 모아 완전한 라인 단위로 디코딩하는 핸들러 생성 (청크 경계로 멀티바이트가 쪼개지는 문제 방지)
+function makeLineDecoder(onLine) {
+  let buf = Buffer.alloc(0);
+  const handler = (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    let idx;
+    while ((idx = buf.indexOf(0x0A)) !== -1) {
+      const lineBuf = buf.subarray(0, idx + 1);
+      buf = buf.subarray(idx + 1);
+      onLine(smartDecode(lineBuf));
+    }
+    // \r 기반 진행바 등 개행 없는 출력이 무한 누적되지 않도록 안전 상한 (64KB)
+    if (buf.length > 65536) { onLine(smartDecode(buf)); buf = Buffer.alloc(0); }
+  };
+  handler.flush = () => { if (buf.length) { onLine(smartDecode(buf)); buf = Buffer.alloc(0); } };
+  return handler;
+}
+
 // ─── Sentry helpers ─────────────────────────────────────────────────────────
 
 /**
@@ -138,6 +165,16 @@ db.exec(`
     log_file TEXT
   )
 `);
+
+// ─── 이슈 컬럼 마이그레이션 (기존 DB에도 안전하게 추가) ───────────────────────
+// error_count / warning_count: 빌드별 Issue 개수 (파일이 지워져도 개수는 DB에 보존)
+// issue_file: 생성된 issue_*.md 절대경로 (상세 보기 시 파일 읽기용)
+{
+  const buildCols = db.prepare('PRAGMA table_info(builds)').all().map(c => c.name);
+  if (!buildCols.includes('error_count'))   db.exec('ALTER TABLE builds ADD COLUMN error_count INTEGER');
+  if (!buildCols.includes('warning_count')) db.exec('ALTER TABLE builds ADD COLUMN warning_count INTEGER');
+  if (!buildCols.includes('issue_file'))    db.exec('ALTER TABLE builds ADD COLUMN issue_file TEXT');
+}
 
 // WebSocket connections
 const clients = new Set();
@@ -604,8 +641,16 @@ async function executeBuild(ctx) {
       NDK_ROOT:             process.env.NDK_ROOT         || 'C:\\Android\\Sdk\\ndk\\27.2.12479018',
       JAVA_HOME:            'C:\\Android\\jdk-17-new',
       _JAVA_OPTIONS:        '-Djava.net.preferIPv4Stack=true',
+      // MSVC 컴파일러/링커 메시지를 영어로 강제 (한글 로케일 콘솔 출력의 인코딩 손상 회피)
+      VSLANG:               '1033',
     };
-    const actualBatPath = path.join(finalProjectPath, 'BuildProject.bat');
+    // bat 경로 해결: 프로젝트 폴더의 전용 bat이 있으면 우선 사용(프로젝트별 커스터마이즈 허용),
+    // 없으면 백엔드 공용 템플릿(scripts/BuildProject.bat)으로 폴백한다.
+    // 공용 템플릿은 PROJECT_DIR 내 *.uproject 로 PROJECT_NAME을 자동 탐지하므로 프로젝트 무관하게 동작.
+    const localBatPath  = path.join(finalProjectPath, 'BuildProject.bat');
+    const sharedBatPath = path.join(__dirname, 'scripts', 'BuildProject.bat');
+    const actualBatPath = fs.existsSync(localBatPath) ? localBatPath : sharedBatPath;
+    blogLog('LOG', `[Build] Using build script: ${actualBatPath}${actualBatPath === sharedBatPath ? ' (shared template)' : ' (project-local)'}`);
 
     const batArgs = ['/c', actualBatPath, platform, config];
     if (cleanBuild) batArgs.push('-clean');
@@ -617,23 +662,28 @@ async function executeBuild(ctx) {
     });
     isPreparingBuild = false;
 
-    activeBuildProcess.stdout.on('data', (d) => {
-      const txt = iconv.decode(d, 'cp949');
-      broadcast({ type: 'LOG', data: txt });
-      logLines.push(txt.trimEnd());
-      const lines = txt.trim().split('\n').filter(Boolean);
-      const errLine = lines.find(l => /error|failed|exception/i.test(l) && !/^using |^running |^log file|^total/i.test(l));
-      if (errLine) lastErrorLine = errLine.trim();
+    const stdoutDecoder = makeLineDecoder((line) => {
+      const txt = line.replace(/\r?\n$/, '');
+      broadcast({ type: 'LOG', data: line });
+      logLines.push(txt);
+      if (/error|failed|exception/i.test(txt) && !/^using |^running |^log file|^total/i.test(txt.trim())) {
+        lastErrorLine = txt.trim();
+      }
     });
-    activeBuildProcess.stderr.on('data', (d) => {
-      const txt = iconv.decode(d, 'cp949');
-      broadcast({ type: 'LOG_ERROR', data: txt });
-      logLines.push(`[STDERR] ${txt.trimEnd()}`);
-      const lines = txt.trim().split('\n').filter(Boolean);
-      if (lines.length > 0) lastErrorLine = lines[lines.length - 1].trim();
+    const stderrDecoder = makeLineDecoder((line) => {
+      const txt = line.replace(/\r?\n$/, '');
+      broadcast({ type: 'LOG_ERROR', data: line });
+      logLines.push(`[STDERR] ${txt}`);
+      if (txt.trim()) lastErrorLine = txt.trim();
     });
+    activeBuildProcess.stdout.on('data', stdoutDecoder);
+    activeBuildProcess.stderr.on('data', stderrDecoder);
 
     activeBuildProcess.on('close', async (code) => {
+      // 개행 없이 남은 마지막 라인 버퍼를 방출
+      stdoutDecoder.flush();
+      stderrDecoder.flush();
+
       const endTime         = new Date();
       const durationSeconds = Math.round((endTime - startTime) / 1000);
       let   status          = code === 0 ? 'Success' : 'Failed';
@@ -760,6 +810,10 @@ async function executeBuild(ctx) {
       }
 
       // ─── Issue 파일 생성 (Warning/Error 필터링 후 중복 제거) ──────────────
+      // 아래 값들은 DB(builds 테이블)에도 기록되어 Analytics & History에서 사용된다.
+      let issueErrorCount   = null;
+      let issueWarningCount = null;
+      let savedIssueFile    = null;
       try {
         const issueDir = path.join(finalProjectPath, 'Saved', 'Builds', platform, config, 'Issue');
         const issueFilePath = path.join(issueDir, `issue_${logTimestamp}.md`);
@@ -842,13 +896,16 @@ async function executeBuild(ctx) {
           : `## Warnings\n\n_없음_\n`;
 
         fs.writeFileSync(issueFilePath, issueHeader + errorSection + warningSection, 'utf8');
+        issueErrorCount   = errors.length;
+        issueWarningCount = warnings.length;
+        savedIssueFile    = issueFilePath;
         broadcast({ type: 'LOG', data: `[WebBuilder] 🔍 Issue report saved: ${issueFilePath} (${errors.length} errors, ${warnings.length} warnings)` });
       } catch (issueErr) {
         broadcast({ type: 'LOG', data: `[WebBuilder] ⚠️ Issue file write failed: ${issueErr.message}` });
       }
 
-      db.prepare('UPDATE builds SET status = ?, end_time = ?, duration_seconds = ?, log_file = ? WHERE id = ?')
-        .run(status, endTime.toISOString(), durationSeconds, savedLogFile, buildId);
+      db.prepare('UPDATE builds SET status = ?, end_time = ?, duration_seconds = ?, log_file = ?, error_count = ?, warning_count = ?, issue_file = ? WHERE id = ?')
+        .run(status, endTime.toISOString(), durationSeconds, savedLogFile, issueErrorCount, issueWarningCount, savedIssueFile, buildId);
 
       broadcast({
         type:        'STATUS',
@@ -859,6 +916,8 @@ async function executeBuild(ctx) {
         archivePath:  status === 'Success' ? archivePath : null,
         lastError:    status === 'Failed'  ? (lastErrorLine || null) : null,
         sentryStatus: sentryStatus,
+        errorCount:   issueErrorCount,
+        warningCount: issueWarningCount,
       });
 
       activeBuildProcess = null;
@@ -900,6 +959,11 @@ app.post('/api/build', (req, res) => {
   // Engine/Project 경로는 UI 입력(Engine Directory Path / Project Directory Path)에서 반드시 전달되어야 한다.
   if (!enginePath || !projectPath) {
     return res.status(400).json({ error: 'Missing enginePath or projectPath (set them in the UI)' });
+  }
+  // 프로젝트 폴더에 .uproject가 실제로 존재하는지 사전 검증 (잘못된 경로일 때 cmd 레벨의
+  // 모호한 에러 대신 명확한 메시지 반환). 공용 bat 템플릿도 이 파일명으로 PROJECT_NAME을 유도한다.
+  if (!getProjectName(projectPath)) {
+    return res.status(400).json({ error: `No .uproject found in projectPath: ${projectPath}` });
   }
 
   const buildId          = uuidv4();
@@ -1049,8 +1113,68 @@ app.get('/api/analytics', (req, res) => {
   const successfulBuilds = db.prepare("SELECT COUNT(*) as count FROM builds WHERE status = 'Success'").get().count;
   const failedBuilds     = db.prepare("SELECT COUNT(*) as count FROM builds WHERE status = 'Failed'").get().count;
   const platformStats    = db.prepare('SELECT platform, COUNT(*) as count FROM builds GROUP BY platform').all();
-  res.json({ totalBuilds, successfulBuilds, failedBuilds, platformStats });
+  // 이슈 집계 (이슈 개수가 기록된 빌드만 대상 — 과거 빌드는 NULL이라 제외됨)
+  const issueAgg         = db.prepare('SELECT COALESCE(SUM(error_count),0) as totalErrors, COALESCE(SUM(warning_count),0) as totalWarnings, COUNT(error_count) as buildsWithIssues FROM builds').get();
+  res.json({
+    totalBuilds, successfulBuilds, failedBuilds, platformStats,
+    totalErrors:      issueAgg.totalErrors,
+    totalWarnings:    issueAgg.totalWarnings,
+    buildsWithIssues: issueAgg.buildsWithIssues,
+  });
 });
+
+// GET /api/issue?id={buildId} — 특정 빌드의 Issue 상세(에러/경고 목록) 반환
+app.get('/api/issue', (req, res) => {
+  const { id } = req.query;
+  if (!id) return res.status(400).json({ error: 'id query parameter is required' });
+
+  const row = db.prepare('SELECT id, platform, config, status, error_count, warning_count, issue_file FROM builds WHERE id = ?').get(id);
+  if (!row) return res.status(404).json({ error: 'build not found' });
+
+  const meta = {
+    buildId:      row.id,
+    platform:     row.platform,
+    config:       row.config,
+    status:       row.status,
+    errorCount:   row.error_count,
+    warningCount: row.warning_count,
+    issueFile:    row.issue_file,
+  };
+
+  // 이슈 개수 자체가 기록되지 않은 과거 빌드
+  if (row.error_count === null && row.warning_count === null) {
+    return res.json({ ...meta, available: false, reason: 'no-record', errors: [], warnings: [] });
+  }
+  // 파일이 없거나(예: Clear Cache로 Saved 폴더 삭제됨) 경로 미기록
+  if (!row.issue_file || !fs.existsSync(row.issue_file)) {
+    return res.json({ ...meta, available: false, reason: 'file-missing', errors: [], warnings: [] });
+  }
+
+  try {
+    const md = fs.readFileSync(row.issue_file, 'utf8');
+    const { errors, warnings } = parseIssueMarkdown(md);
+    res.json({ ...meta, available: true, errors, warnings });
+  } catch (err) {
+    res.status(500).json({ ...meta, available: false, reason: 'read-error', message: err.message, errors: [], warnings: [] });
+  }
+});
+
+// issue_*.md 의 "## Errors" / "## Warnings" 섹션에서 "- `...`" 항목을 파싱
+function parseIssueMarkdown(md) {
+  const lines = md.split(/\r?\n/);
+  const errors = [];
+  const warnings = [];
+  let section = null; // 'errors' | 'warnings' | null
+  for (const line of lines) {
+    const h = line.match(/^##\s+(Errors|Warnings)\b/i);
+    if (h) { section = h[1].toLowerCase() === 'errors' ? 'errors' : 'warnings'; continue; }
+    const m = line.match(/^-\s+`(.*)`\s*$/);
+    if (m && section) {
+      (section === 'errors' ? errors : warnings).push(m[1]);
+    }
+  }
+  return { errors, warnings };
+}
 
 server.listen(PORT, () => {
   console.log(`Build Server running on http://localhost:${PORT}`);

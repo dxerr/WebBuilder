@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Play, Activity, History, Terminal as TerminalIcon, XCircle, GitBranch, GitCommit, Tag, RefreshCw, ChevronDown, Check, FolderOpen, AlertTriangle, CheckCircle2, Trash2, Sparkles, Upload, Flame } from 'lucide-react';
+import { Play, Activity, History, Terminal as TerminalIcon, XCircle, GitBranch, GitCommit, Tag, RefreshCw, ChevronDown, Check, FolderOpen, AlertTriangle, AlertCircle, CheckCircle2, Trash2, Sparkles, Upload, Flame } from 'lucide-react';
 import { format } from 'date-fns';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -381,6 +381,25 @@ function BuildResultCard({ result }: { result: BuildResult }) {
   );
 }
 
+// ─── Issue 목록 (모달 내부) ───────────────────────────────────────────────────
+function IssueList({ title, items, color, bg }: { title: string; items?: string[]; color: string; bg: string }) {
+  const list = items || [];
+  return (
+    <div style={{ marginBottom: '1rem' }}>
+      <div style={{ fontWeight: 600, color, fontSize: '0.85rem', marginBottom: '0.5rem' }}>{title} ({list.length})</div>
+      {list.length === 0 ? (
+        <div style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', padding: '0.4rem 0' }}>None</div>
+      ) : (
+        <div style={{ background: bg, borderRadius: '0.5rem', padding: '0.6rem 0.85rem', display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+          {list.map((line, i) => (
+            <div key={i} style={{ fontFamily: 'monospace', fontSize: '0.75rem', color: 'var(--text-primary)', wordBreak: 'break-word', lineHeight: 1.5 }}>{line}</div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main App ────────────────────────────────────────────────────────────────
 export default function App() {
   const [activeTab, setActiveTab]   = useState<'build' | 'analytics'>('build');
@@ -411,6 +430,8 @@ export default function App() {
   const [analytics, setAnalytics]     = useState<any>(null);
   const [revertConfirm, setRevertConfirm] = useState<{ buildId: string; files: string[] } | null>(null);
   const [isBuildLocked, setIsBuildLocked] = useState(false);
+  // Issue 상세 모달 (Execution History의 Issues 컬럼 클릭 시)
+  const [issueDetail, setIssueDetail] = useState<any | null>(null);
 
   const terminalRef = useRef<HTMLDivElement>(null);
 
@@ -498,6 +519,17 @@ export default function App() {
 
   const fetchHistory   = async () => { try { const r = await fetch(`${API_URL}/history`);  setHistory(await r.json());  } catch(e){} };
   const fetchAnalytics = async () => { try { const r = await fetch(`${API_URL}/analytics`); setAnalytics(await r.json()); } catch(e){} };
+
+  const openIssueDetail = async (record: any) => {
+    setIssueDetail({ loading: true, meta: record });
+    try {
+      const r = await fetch(`${API_URL}/issue?id=${encodeURIComponent(record.id)}`);
+      const data = await r.json();
+      setIssueDetail({ loading: false, meta: record, ...data });
+    } catch (e) {
+      setIssueDetail({ loading: false, available: false, reason: 'read-error', errors: [], warnings: [], meta: record });
+    }
+  };
 
   const handleBuild = () => {
     if (!enginePath.trim() || !projectPath.trim()) {
@@ -665,6 +697,73 @@ export default function App() {
                   <Trash2 size={14}/> Confirm & Build
                 </button>
               </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Issue 상세 모달 ── */}
+      <AnimatePresence>
+        {issueDetail && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            onClick={() => setIssueDetail(null)}
+            style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }}
+              onClick={e => e.stopPropagation()}
+              style={{ background: 'var(--panel-bg)', border: '1px solid rgba(56,189,248,0.3)', borderRadius: '1rem', padding: '1.75rem', maxWidth: '720px', width: '92%', maxHeight: '80vh', display: 'flex', flexDirection: 'column', boxShadow: '0 0 40px rgba(56,189,248,0.12)' }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                  <AlertTriangle size={20} color="var(--primary-color)"/>
+                  <span style={{ fontWeight: 700, fontSize: '1.05rem' }}>Build Issues</span>
+                  {issueDetail.meta && (
+                    <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
+                      {issueDetail.meta.platform} · {issueDetail.meta.config}
+                    </span>
+                  )}
+                </div>
+                <button onClick={() => setIssueDetail(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}>
+                  <XCircle size={20}/>
+                </button>
+              </div>
+
+              {issueDetail.loading ? (
+                <div style={{ padding: '2rem', textAlign: 'center', color: 'var(--text-secondary)' }}>Loading…</div>
+              ) : issueDetail.available === false ? (
+                <div style={{ padding: '1.5rem', textAlign: 'center', color: 'var(--text-secondary)', background: 'rgba(255,255,255,0.03)', borderRadius: '0.5rem' }}>
+                  {issueDetail.reason === 'file-missing'
+                    ? `Issue file is no longer available (may have been removed by a Clear Cache build). Counts: ${issueDetail.errorCount ?? 0} errors, ${issueDetail.warningCount ?? 0} warnings.`
+                    : issueDetail.reason === 'no-record'
+                    ? 'This build predates issue tracking — no issue data was recorded.'
+                    : 'Could not load the issue report.'}
+                </div>
+              ) : (
+                <div style={{ overflowY: 'auto', paddingRight: '0.5rem' }}>
+                  <div style={{ display: 'flex', gap: '1.5rem', marginBottom: '1rem', fontSize: '0.85rem' }}>
+                    <span style={{ color: 'var(--error-color)', fontWeight: 600, display: 'inline-flex', gap: '0.35rem', alignItems: 'center' }}>
+                      <AlertTriangle size={14}/> {issueDetail.errors?.length ?? 0} Errors
+                    </span>
+                    <span style={{ color: '#f59e0b', fontWeight: 600, display: 'inline-flex', gap: '0.35rem', alignItems: 'center' }}>
+                      <AlertCircle size={14}/> {issueDetail.warnings?.length ?? 0} Warnings
+                    </span>
+                  </div>
+
+                  <IssueList title="Errors" items={issueDetail.errors} color="var(--error-color)" bg="rgba(248,113,113,0.06)"/>
+                  <IssueList title="Warnings" items={issueDetail.warnings} color="#f59e0b" bg="rgba(245,158,11,0.06)"/>
+
+                  {issueDetail.issueFile && (
+                    <button
+                      onClick={() => fetch(`${API_URL}/open-folder`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: issueDetail.issueFile.replace(/[/\\][^/\\]*$/, '') }) })}
+                      style={{ marginTop: '1rem', padding: '0.5rem 1rem', background: 'rgba(56,189,248,0.1)', border: '1px solid rgba(56,189,248,0.3)', color: 'var(--primary-color)', borderRadius: '0.5rem', cursor: 'pointer', fontSize: '0.8rem', display: 'inline-flex', alignItems: 'center', gap: '0.4rem' }}
+                    >
+                      <FolderOpen size={14}/> Open Issue Folder
+                    </button>
+                  )}
+                </div>
+              )}
             </motion.div>
           </motion.div>
         )}
@@ -980,6 +1079,8 @@ export default function App() {
               <div className="glass-panel stat-card"><div className="stat-label">Successful Builds</div><div className="stat-value" style={{ color: 'var(--success-color)' }}>{analytics?.successfulBuilds || 0}</div></div>
               <div className="glass-panel stat-card"><div className="stat-label">Failed Builds</div><div className="stat-value" style={{ color: 'var(--error-color)' }}>{analytics?.failedBuilds || 0}</div></div>
               <div className="glass-panel stat-card"><div className="stat-label">Success Rate</div><div className="stat-value">{analytics?.totalBuilds ? Math.round((analytics.successfulBuilds / analytics.totalBuilds) * 100) : 0}%</div></div>
+              <div className="glass-panel stat-card"><div className="stat-label">Total Errors</div><div className="stat-value" style={{ color: 'var(--error-color)' }}>{analytics?.totalErrors ?? 0}</div></div>
+              <div className="glass-panel stat-card"><div className="stat-label">Total Warnings</div><div className="stat-value" style={{ color: '#f59e0b' }}>{analytics?.totalWarnings ?? 0}</div></div>
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem', marginBottom: '2rem' }}>
               <div className="glass-panel" style={{ padding: '1.5rem', height: '300px' }}>
@@ -1007,18 +1108,38 @@ export default function App() {
             <div className="glass-panel" style={{ padding: '1.5rem', overflowX: 'auto' }}>
               <h3 style={{ marginBottom: '1.5rem', fontSize: '1rem' }}>Execution History</h3>
               <table className="history-table">
-                <thead><tr><th>Configuration</th><th>Platform</th><th>Status</th><th>Duration</th><th>Date</th></tr></thead>
+                <thead><tr><th>Configuration</th><th>Platform</th><th>Status</th><th>Duration</th><th>Issues</th><th>Date</th></tr></thead>
                 <tbody>
-                  {history.map(record => (
+                  {history.map(record => {
+                    const hasIssueRecord = record.error_count !== null && record.error_count !== undefined;
+                    return (
                     <tr key={record.id}>
                       <td style={{ fontWeight: 500 }}>{record.config}</td>
                       <td>{record.platform}</td>
                       <td><span className={`badge ${record.status.toLowerCase()}`}>{record.status}</span></td>
                       <td>{record.duration_seconds ? `${record.duration_seconds}s` : '-'}</td>
+                      <td>
+                        {hasIssueRecord ? (
+                          <button
+                            onClick={() => openIssueDetail(record)}
+                            title="View error / warning details"
+                            style={{ display: 'inline-flex', gap: '0.4rem', alignItems: 'center', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+                          >
+                            <span style={{ display: 'inline-flex', gap: '0.25rem', alignItems: 'center', color: record.error_count > 0 ? 'var(--error-color)' : 'var(--text-secondary)', fontWeight: 600 }}>
+                              <AlertTriangle size={13}/> {record.error_count}
+                            </span>
+                            <span style={{ display: 'inline-flex', gap: '0.25rem', alignItems: 'center', color: record.warning_count > 0 ? '#f59e0b' : 'var(--text-secondary)', fontWeight: 600 }}>
+                              <AlertCircle size={13}/> {record.warning_count}
+                            </span>
+                          </button>
+                        ) : (
+                          <span style={{ color: 'var(--text-secondary)' }}>–</span>
+                        )}
+                      </td>
                       <td style={{ color: 'var(--text-secondary)' }}>{format(new Date(record.start_time), 'MMM dd, HH:mm:ss')}</td>
                     </tr>
-                  ))}
-                  {history.length === 0 && <tr><td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-secondary)', padding: '2rem' }}>No execution history found.</td></tr>}
+                  );})}
+                  {history.length === 0 && <tr><td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-secondary)', padding: '2rem' }}>No execution history found.</td></tr>}
                 </tbody>
               </table>
             </div>
