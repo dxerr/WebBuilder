@@ -27,16 +27,42 @@ function smartDecode(buf) {
   catch { return iconv.decode(buf, 'cp949'); }
 }
 // data 청크를 모아 완전한 라인 단위로 디코딩하는 핸들러 생성 (청크 경계로 멀티바이트가 쪼개지는 문제 방지)
+// UBT의 진행률 표시(\r)에도 즉각 반응하여 화면에 뿌려줄 수 있도록 \n 뿐 아니라 \r 에서도 분할(Flush)합니다.
 function makeLineDecoder(onLine) {
   let buf = Buffer.alloc(0);
   const handler = (chunk) => {
     buf = Buffer.concat([buf, chunk]);
-    let idx;
-    while ((idx = buf.indexOf(0x0A)) !== -1) {
-      const lineBuf = buf.subarray(0, idx + 1);
-      buf = buf.subarray(idx + 1);
-      onLine(smartDecode(lineBuf));
+    
+    while (true) {
+      const idxN = buf.indexOf(0x0A); // \n
+      const idxR = buf.indexOf(0x0D); // \r
+      
+      let splitIdx = -1;
+      let consumeBytes = 1;
+
+      if (idxN !== -1 && idxR !== -1) {
+        if (idxR + 1 === idxN) {
+          splitIdx = idxR;
+          consumeBytes = 2; // \r\n
+        } else {
+          splitIdx = Math.min(idxN, idxR);
+        }
+      } else if (idxN !== -1) {
+        splitIdx = idxN;
+      } else if (idxR !== -1) {
+        splitIdx = idxR;
+      } else {
+        break; // No newline or carriage return found
+      }
+
+      const lineBuf = buf.subarray(0, splitIdx);
+      buf = buf.subarray(splitIdx + consumeBytes);
+      
+      if (lineBuf.length > 0) {
+        onLine(smartDecode(lineBuf));
+      }
     }
+    
     // \r 기반 진행바 등 개행 없는 출력이 무한 누적되지 않도록 안전 상한 (64KB)
     if (buf.length > 65536) { onLine(smartDecode(buf)); buf = Buffer.alloc(0); }
   };
@@ -518,72 +544,80 @@ async function executeBuild(ctx) {
   try {
     // -- PHASE 1: Git sync (always runs) ------------------------------------------
 
-    // git fetch --all
-    broadcast({ type: 'STEP', ...STEPS.GIT_FETCH, buildId });
-    blogLog('LOG', `[Git] Step ${STEPS.GIT_FETCH.step}/${STEPS.GIT_FETCH.total} fetch --all`);
-    await execAsync(`git -C "${finalProjectPath}" fetch --all`);
-    blogLog('LOG', `[Git] fetch complete`);
-    if (isCancelling) throw new Error('Canceled during git fetch');
-
-    if (gitRevision) {
-      // STEP 3/5 - checkout specified revision
+    if (!ctx.isGitRepo) {
+      blogLog('LOG', `[Git] Step 2~4 skip (No Git Repo)`);
+      broadcast({ type: 'STEP', ...STEPS.GIT_FETCH, buildId });
       broadcast({ type: 'STEP', ...STEPS.GIT_SWITCH, buildId });
-      blogLog('LOG', `[Git] Step ${STEPS.GIT_SWITCH.step}/${STEPS.GIT_SWITCH.total} checkout: ${gitRevision}`);
-      const { stdout: localList } = await execAsync(`git -C "${finalProjectPath}" branch --list "${gitRevision}"`);
-      const isLocalBranch = localList.trim().length > 0;
-      const { stdout: remoteList } = await execAsync(`git -C "${finalProjectPath}" branch -r --list "origin/${gitRevision}"`);
-      const isRemoteOnly = !isLocalBranch && remoteList.trim().length > 0;
-      if (isRemoteOnly) {
-        await execAsync(`git -C "${finalProjectPath}" checkout -B "${gitRevision}" --track "origin/${gitRevision}"`);
-        blogLog('LOG', `[Git] 리모트 전용 브랜치 로컬 트래킹 checkout: ${gitRevision}`);
-      } else {
-        await execAsync(`git -C "${finalProjectPath}" checkout ${gitRevision}`);
-        blogLog('LOG', `[Git] checkout 완료`);
-      }
-      if (isCancelling) throw new Error('Canceled during git checkout');
-
-      // STEP 4/5 - pull if branch
-      const isBranch = await isBranchName(finalProjectPath, gitRevision);
-      if (isBranch) {
-        broadcast({ type: 'STEP', ...STEPS.GIT_PULL, buildId });
-        blogLog('LOG', `[Git] Step ${STEPS.GIT_PULL.step}/${STEPS.GIT_PULL.total} pull (branch: ${gitRevision})`);
-        await execAsync(`git -C "${finalProjectPath}" merge --abort`).catch(() => {});
-        await execAsync(`git -C "${finalProjectPath}" reset --hard origin/${gitRevision}`);
-        blogLog('LOG', `[Git] pull done`);
-        if (isCancelling) throw new Error('Canceled during git pull');
-      } else {
-        blogLog('LOG', `[Git] Step 4/5 pull skip (detached HEAD / tag)`);
-      }
-
-    } else {
-      // HEAD mode: no checkout, but still fetch+pull current branch for latest commits
-      broadcast({ type: 'STEP', ...STEPS.GIT_SWITCH, buildId });
-      blogLog('LOG', `[Git] Step ${STEPS.GIT_SWITCH.step}/${STEPS.GIT_SWITCH.total} HEAD (checkout 생략, 현재 브랜치 연결 유지)`);
-
-      let currentBranch = '';
-      try {
-        const { stdout: abbrev } = await execAsync(`git -C "${finalProjectPath}" rev-parse --abbrev-ref HEAD`);
-        currentBranch = abbrev.trim();
-      } catch (_) {}
-
-      if (currentBranch && currentBranch !== 'HEAD') {
-        broadcast({ type: 'STEP', ...STEPS.GIT_PULL, buildId });
-        blogLog('LOG', `[Git] Step ${STEPS.GIT_PULL.step}/${STEPS.GIT_PULL.total} pull (branch: ${currentBranch})`);
-        await execAsync(`git -C "${finalProjectPath}" merge --abort`).catch(() => {});
-        await execAsync(`git -C "${finalProjectPath}" reset --hard origin/${currentBranch}`);
-        blogLog('LOG', `[Git] pull done`);
-        if (isCancelling) throw new Error('Canceled during git pull');
-      } else {
-        blogLog('LOG', `[Git] Step 4/5 pull skip (detached HEAD)`);
-      }
-    }
-
-    // Final HEAD info (always shown)
-    {
-      const { stdout: headSha } = await execAsync(`git -C "${finalProjectPath}" rev-parse --short HEAD`);
-      const { stdout: headMsg } = await execAsync(`git -C "${finalProjectPath}" log -1 --pretty=format:"%s"`);
-      blogLog('LOG', `[Git] Latest commit HEAD: ${headSha.trim()} "${headMsg.trim()}""`);
+      broadcast({ type: 'STEP', ...STEPS.GIT_PULL, buildId });
       broadcast({ type: 'GIT_DONE', buildId });
+    } else {
+      // git fetch --all
+      broadcast({ type: 'STEP', ...STEPS.GIT_FETCH, buildId });
+      blogLog('LOG', `[Git] Step ${STEPS.GIT_FETCH.step}/${STEPS.GIT_FETCH.total} fetch --all in ${ctx.gitRepoPath}`);
+      await execAsync(`git -C "${ctx.gitRepoPath}" fetch --all`);
+      blogLog('LOG', `[Git] fetch complete`);
+      if (isCancelling) throw new Error('Canceled during git fetch');
+
+      if (gitRevision) {
+        // STEP 3/5 - checkout specified revision
+        broadcast({ type: 'STEP', ...STEPS.GIT_SWITCH, buildId });
+        blogLog('LOG', `[Git] Step ${STEPS.GIT_SWITCH.step}/${STEPS.GIT_SWITCH.total} checkout: ${gitRevision}`);
+        const { stdout: localList } = await execAsync(`git -C "${ctx.gitRepoPath}" branch --list "${gitRevision}"`);
+        const isLocalBranch = localList.trim().length > 0;
+        const { stdout: remoteList } = await execAsync(`git -C "${ctx.gitRepoPath}" branch -r --list "origin/${gitRevision}"`);
+        const isRemoteOnly = !isLocalBranch && remoteList.trim().length > 0;
+        if (isRemoteOnly) {
+          await execAsync(`git -C "${ctx.gitRepoPath}" checkout -B "${gitRevision}" --track "origin/${gitRevision}"`);
+          blogLog('LOG', `[Git] 리모트 전용 브랜치 로컬 트래킹 checkout: ${gitRevision}`);
+        } else {
+          await execAsync(`git -C "${ctx.gitRepoPath}" checkout ${gitRevision}`);
+          blogLog('LOG', `[Git] checkout 완료`);
+        }
+        if (isCancelling) throw new Error('Canceled during git checkout');
+
+        // STEP 4/5 - pull if branch
+        const isBranch = await isBranchName(ctx.gitRepoPath, gitRevision);
+        if (isBranch) {
+          broadcast({ type: 'STEP', ...STEPS.GIT_PULL, buildId });
+          blogLog('LOG', `[Git] Step ${STEPS.GIT_PULL.step}/${STEPS.GIT_PULL.total} pull (branch: ${gitRevision})`);
+          await execAsync(`git -C "${ctx.gitRepoPath}" merge --abort`).catch(() => {});
+          await execAsync(`git -C "${ctx.gitRepoPath}" reset --hard origin/${gitRevision}`);
+          blogLog('LOG', `[Git] pull done`);
+          if (isCancelling) throw new Error('Canceled during git pull');
+        } else {
+          blogLog('LOG', `[Git] Step 4/5 pull skip (detached HEAD / tag)`);
+        }
+
+      } else {
+        // HEAD mode: no checkout, but still fetch+pull current branch for latest commits
+        broadcast({ type: 'STEP', ...STEPS.GIT_SWITCH, buildId });
+        blogLog('LOG', `[Git] Step ${STEPS.GIT_SWITCH.step}/${STEPS.GIT_SWITCH.total} HEAD (checkout 생략, 현재 브랜치 연결 유지)`);
+
+        let currentBranch = '';
+        try {
+          const { stdout: abbrev } = await execAsync(`git -C "${ctx.gitRepoPath}" rev-parse --abbrev-ref HEAD`);
+          currentBranch = abbrev.trim();
+        } catch (_) {}
+
+        if (currentBranch && currentBranch !== 'HEAD') {
+          broadcast({ type: 'STEP', ...STEPS.GIT_PULL, buildId });
+          blogLog('LOG', `[Git] Step ${STEPS.GIT_PULL.step}/${STEPS.GIT_PULL.total} pull (branch: ${currentBranch})`);
+          await execAsync(`git -C "${ctx.gitRepoPath}" merge --abort`).catch(() => {});
+          await execAsync(`git -C "${ctx.gitRepoPath}" reset --hard origin/${currentBranch}`);
+          blogLog('LOG', `[Git] pull done`);
+          if (isCancelling) throw new Error('Canceled during git pull');
+        } else {
+          blogLog('LOG', `[Git] Step 4/5 pull skip (detached HEAD)`);
+        }
+      }
+
+      // Final HEAD info (always shown)
+      {
+        const { stdout: headSha } = await execAsync(`git -C "${ctx.gitRepoPath}" rev-parse --short HEAD`);
+        const { stdout: headMsg } = await execAsync(`git -C "${ctx.gitRepoPath}" log -1 --pretty=format:"%s"`);
+        blogLog('LOG', `[Git] Latest commit HEAD: ${headSha.trim()} "${headMsg.trim()}""`);
+        broadcast({ type: 'GIT_DONE', buildId });
+      }
     }
     // -- PHASE 1.5: Clear Cache (optional) --
     if (clearCache) {
@@ -678,24 +712,46 @@ async function executeBuild(ctx) {
     });
     isPreparingBuild = false;
 
+    let lastLogTime = Date.now();
+
     const stdoutDecoder = makeLineDecoder((line) => {
+      lastLogTime = Date.now();
       const txt = line.replace(/\r?\n$/, '');
-      broadcast({ type: 'LOG', data: line });
+      broadcast({ type: 'LOG', data: txt }); // line instead of txt to preserve output if needed, but txt is cleaner
       logLines.push(txt);
       if (/error|failed|exception/i.test(txt) && !/^using |^running |^log file|^total/i.test(txt.trim())) {
         lastErrorLine = txt.trim();
       }
     });
     const stderrDecoder = makeLineDecoder((line) => {
+      lastLogTime = Date.now();
       const txt = line.replace(/\r?\n$/, '');
-      broadcast({ type: 'LOG_ERROR', data: line });
+      broadcast({ type: 'LOG_ERROR', data: txt });
       logLines.push(`[STDERR] ${txt}`);
       if (txt.trim()) lastErrorLine = txt.trim();
     });
+
     activeBuildProcess.stdout.on('data', stdoutDecoder);
     activeBuildProcess.stderr.on('data', stderrDecoder);
 
+    // 컴파일이 길어져서 출력 로그가 안 나오는 경우를 대비한 헬퍼 (무한대기 방지 알림)
+    const compilerMonitor = setInterval(async () => {
+      // 15초 이상 로그 갱신이 없으면 백그라운드 컴파일러 개수 확인
+      if (Date.now() - lastLogTime > 15000) {
+        try {
+          const { stdout } = await execAsync('powershell -NoProfile -Command "@(Get-Process | Where-Object { $_.Name -match \'clang|ispc|cl|link|lld\' }).Count"');
+          const count = parseInt(stdout.trim(), 10);
+          if (count > 0) {
+            broadcast({ type: 'LOG', data: `[진행률 알림] 백그라운드에서 C++ 컴파일이 진행 중입니다... (현재 작동 중인 컴파일러: ${count}개)` });
+            // 너무 자주 뜨지 않도록 갱신 (15초 뒤에 다시 체크)
+            lastLogTime = Date.now();
+          }
+        } catch(e) {}
+      }
+    }, 5000);
+
     activeBuildProcess.on('close', async (code) => {
+      clearInterval(compilerMonitor);
       // 개행 없이 남은 마지막 라인 버퍼를 방출
       stdoutDecoder.flush();
       stderrDecoder.flush();
@@ -968,7 +1024,7 @@ app.post('/api/build', (req, res) => {
     return res.status(400).json({ error: 'A build is already in progress' });
   }
 
-  const { platform, config, enginePath, projectPath, gitRevision, cleanBuild, clearCache, cookClean, extraArgs } = req.body;
+  const { platform, config, enginePath, projectPath, gitRepoPath, gitRevision, cleanBuild, clearCache, cookClean, extraArgs } = req.body;
   if (!platform || !config) {
     return res.status(400).json({ error: 'Missing platform or config' });
   }
@@ -1007,7 +1063,7 @@ app.post('/api/build', (req, res) => {
       // UI에서 전달된 경로를 그대로 사용 (핸들러 진입부에서 존재 검증됨)
       const finalEnginePath  = enginePath;
       const finalProjectPath = projectPath;
-      const ctx = { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision, cleanBuild, clearCache, cookClean, extraArgs: extra.value };
+      const ctx = { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRepoPath, gitRevision, cleanBuild, clearCache, cookClean, extraArgs: extra.value };
 
       // Sentry 사전 판정 (Git Check 스텝 total 표시에 필요)
       const _sentryProps = parseSentryProperties(finalProjectPath);
@@ -1018,31 +1074,60 @@ app.post('/api/build', (req, res) => {
 
       // STEP 1: 로컬 변경사항 존재 여부 확인 (충돌 방지)
       broadcast({ type: 'STEP', ...STEPS.GIT_CHECK, buildId });
-      broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_CHECK.step}/${STEPS.GIT_CHECK.total} local changes check` });
-
-      const { stdout: statusOut } = await execAsync(`git -C "${finalProjectPath}" status --porcelain`);
-      const changedFiles = statusOut.trim().split('\n').filter(Boolean)
-        .map(l => l.trim())
-        .filter(l => !l.startsWith('?')); // untracked 파일(?)은 Git 버전에 영향을 받지 않으므로 경고하지 않음
-
-      if (changedFiles.length > 0) {
-        // 파일이 감지되었다면 리스트업 수행 후 UI 측으로 CONFIRM 트리거 발송
-        broadcast({ type: 'LOG', data: `[Git] 충돌 유발 가능한 파일 개수: ${changedFiles.length}개 발견` });
-        changedFiles.forEach(f => broadcast({ type: 'LOG', data: `       ${f}` }));
-
-        pendingBuildContext = ctx;
-        broadcast({
-          type: 'CONFIRM_REVERT',
-          buildId,
-          files: changedFiles,
-          message: `로컬 변경사항이 ${changedFiles.length}개 존재합니다. 모두 Revert 처리 후 빌드를 진행하시겠습니까?`
-        });
-        // UI의 사용자 결정(confirm 또는 cancel API 호출) 대기상태가 되므로 여기서 흐름 명시적 종료
-        return;
+      
+      let isGitRepo = false;
+      if (gitRepoPath) {
+        try {
+          await execAsync(`git -C "${gitRepoPath}" rev-parse --is-inside-work-tree`);
+          isGitRepo = true;
+        } catch (_) {}
       }
 
-      broadcast({ type: 'LOG', data: `[Git] 로컬 환경 클린 상태. 충돌 없음` });
+      if (!isGitRepo) {
+        broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_CHECK.step}/${STEPS.GIT_CHECK.total} No valid Git repository specified, skipping check` });
+      } else {
+        broadcast({ type: 'LOG',  data: `[Git] Step ${STEPS.GIT_CHECK.step}/${STEPS.GIT_CHECK.total} local changes check in ${gitRepoPath}` });
 
+        const { stdout: statusOut } = await execAsync(`git -C "${gitRepoPath}" status --porcelain -uno`, { maxBuffer: 1024 * 1024 * 10 });
+        const changedFiles = statusOut.trim().split('\n').filter(Boolean)
+          .map(l => l.trim())
+          .filter(l => !l.startsWith('?')); // untracked 파일(?)은 Git 버전에 영향을 받지 않으므로 경고하지 않음
+
+        if (changedFiles.length > 0) {
+          // 파일이 감지되었다면 리스트업 수행 후 UI 측으로 CONFIRM 트리거 발송
+          broadcast({ type: 'LOG', data: `[Git] 충돌 유발 가능한 파일 개수: ${changedFiles.length}개 발견` });
+          changedFiles.forEach(f => broadcast({ type: 'LOG', data: `       ${f}` }));
+
+          pendingBuildContext = ctx;
+          broadcast({
+            type: 'CONFIRM_REVERT',
+            buildId,
+            files: changedFiles,
+            message: `로컬 변경사항이 ${changedFiles.length}개 존재합니다. 모두 Revert 처리 후 빌드를 진행하시겠습니까?`
+          });
+          // UI의 사용자 결정(confirm 또는 cancel API 호출) 대기상태가 되므로 여기서 흐름 명시적 종료
+          return;
+        }
+
+        broadcast({ type: 'LOG', data: `[Git] 로컬 환경 클린 상태. 충돌 없음` });
+      }
+
+      // STEP 1.5: Lock Check
+      if (isGitRepo) {
+        const lockPath = path.join(gitRepoPath, '.git', 'index.lock');
+        if (fs.existsSync(lockPath)) {
+          pendingBuildContext = ctx;
+          broadcast({
+            type: 'CONFIRM_UNLOCK',
+            buildId,
+            message: `Git Lock 파일(.git/index.lock)이 감지되었습니다. 이전 작업이 비정상 종료되었을 수 있습니다. 강제로 락을 해제하고 진행하시겠습니까?`
+          });
+          return;
+        }
+      }
+
+      // Add isGitRepo to ctx so executeBuild knows whether to run Git Sync
+      ctx.isGitRepo = isGitRepo;
       await executeBuild(ctx);
 
     } catch (err) {
@@ -1069,9 +1154,24 @@ app.post('/api/build/confirm', async (req, res) => {
   res.json({ message: 'Confirmed reverting and continuing build' });
 
   try {
-    broadcast({ type: 'LOG', data: '[Git] Revert 餓?.. 筌뤴뫀諭?嚥≪뮇類?癰궰野껋럩沅' });
-    await execAsync(`git -C "${ctx.finalProjectPath}" reset --hard HEAD`);
+    broadcast({ type: 'LOG', data: '[Git] Revert 강제 덮어쓰기 시작...' });
+    await execAsync(`git -C "${ctx.gitRepoPath}" reset --hard HEAD`);
     broadcast({ type: 'LOG', data: '[Git] Revert 완료. 기존 빌드 프로세스 지속' });
+    
+    // Check lock again just in case
+    if (ctx.isGitRepo) {
+      const lockPath = path.join(ctx.gitRepoPath, '.git', 'index.lock');
+      if (fs.existsSync(lockPath)) {
+        pendingBuildContext = ctx;
+        broadcast({
+          type: 'CONFIRM_UNLOCK',
+          buildId: ctx.buildId,
+          message: `Git Lock 파일(.git/index.lock)이 감지되었습니다. 이전 작업이 비정상 종료되었을 수 있습니다. 강제로 락을 해제하고 진행하시겠습니까?`
+        });
+        return;
+      }
+    }
+    
     await executeBuild(ctx);
   } catch (err) {
     isPreparingBuild    = false;
@@ -1080,6 +1180,37 @@ app.post('/api/build/confirm', async (req, res) => {
     isCancelling        = false;
     pendingBuildContext = null;
     broadcast({ type: 'LOG_ERROR', data: `[Error] Revert ${err.message}` });
+    broadcast({ type: 'STATUS',    data: 'Build Failed', buildId: ctx.buildId });
+    db.prepare('UPDATE builds SET status = ?, end_time = ? WHERE id = ?')
+      .run('Failed', new Date().toISOString(), ctx.buildId);
+  }
+});
+
+// POST /api/build/confirm-unlock : Unlock 확인 시 락 해제 후 파이프라인 재개
+app.post('/api/build/confirm-unlock', async (req, res) => {
+  if (!pendingBuildContext) {
+    return res.status(400).json({ error: 'No pending build to confirm unlock' });
+  }
+  const ctx = pendingBuildContext;
+  pendingBuildContext = null;
+  res.json({ message: 'Confirmed unlocking and continuing build' });
+
+  try {
+    if (ctx.isGitRepo) {
+      const lockPath = path.join(ctx.gitRepoPath, '.git', 'index.lock');
+      if (fs.existsSync(lockPath)) {
+        fs.unlinkSync(lockPath);
+        broadcast({ type: 'LOG', data: '[Git] Lock 해제 완료. 기존 빌드 프로세스 지속' });
+      }
+    }
+    await executeBuild(ctx);
+  } catch (err) {
+    isPreparingBuild    = false;
+    activeBuildProcess  = null;
+    activeBuildId       = null;
+    isCancelling        = false;
+    pendingBuildContext = null;
+    broadcast({ type: 'LOG_ERROR', data: `[Error] Unlock ${err.message}` });
     broadcast({ type: 'STATUS',    data: 'Build Failed', buildId: ctx.buildId });
     db.prepare('UPDATE builds SET status = ?, end_time = ? WHERE id = ?')
       .run('Failed', new Date().toISOString(), ctx.buildId);
@@ -1111,6 +1242,23 @@ app.post('/api/build/reset', (req, res) => {
   db.prepare(`UPDATE builds SET status = 'Failed', end_time = CURRENT_TIMESTAMP
               WHERE status = 'Running'`).run();
   res.json({ message: 'Build state reset', wasLocked });
+});
+
+// POST /api/git/clear-lock : UI의 Unlock Git 버튼 API
+app.post('/api/git/clear-lock', (req, res) => {
+  const { gitRepoPath } = req.body;
+  if (!gitRepoPath) return res.status(400).json({ error: 'gitRepoPath is required' });
+  try {
+    const lockPath = path.join(gitRepoPath, '.git', 'index.lock');
+    if (fs.existsSync(lockPath)) {
+      fs.unlinkSync(lockPath);
+      res.json({ message: 'Git Lock(.git/index.lock)이 강제 삭제되었습니다.' });
+    } else {
+      res.json({ message: '현재 Lock 파일이 존재하지 않습니다.' });
+    }
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // GET /api/history

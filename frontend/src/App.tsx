@@ -439,6 +439,7 @@ export default function App() {
   const [history, setHistory]         = useState<any[]>([]);
   const [analytics, setAnalytics]     = useState<any>(null);
   const [revertConfirm, setRevertConfirm] = useState<{ buildId: string; files: string[] } | null>(null);
+  const [unlockConfirm, setUnlockConfirm] = useState<{ buildId: string; message: string } | null>(null);
   const [isBuildLocked, setIsBuildLocked] = useState(false);
   // Issue 상세 모달 (Execution History의 Issues 컬럼 클릭 시)
   const [issueDetail, setIssueDetail] = useState<any | null>(null);
@@ -461,6 +462,7 @@ export default function App() {
           if (s.stepLabels?.length > 0) setBuildStepLabels(s.stepLabels);
           if (s.recentLogs?.length > 0) setLogs(s.recentLogs);
           if (s.revertConfirm) setRevertConfirm(s.revertConfirm);
+          if (s.unlockConfirm) setUnlockConfirm(s.unlockConfirm);
         } else {
           setBuildStatus(s.buildStatus || 'Idle');
         }
@@ -500,6 +502,9 @@ export default function App() {
       } else if (message.type === 'CONFIRM_REVERT') {
         setBuildStatus('Waiting for confirmation...');
         setRevertConfirm({ buildId: message.buildId, files: message.files });
+      } else if (message.type === 'CONFIRM_UNLOCK') {
+        setBuildStatus('Waiting for unlock confirmation...');
+        setUnlockConfirm({ buildId: message.buildId, message: message.message });
       } else if (message.type === 'STATUS') {
         setBuildStatus(message.data);
         if (message.data.includes('Success') || message.data.includes('Failed') || message.data.includes('Canceled')) {
@@ -509,6 +514,7 @@ export default function App() {
           setIsBuilding(false);
           setBuildStep(null);
           setRevertConfirm(null);
+          setUnlockConfirm(null);
           // 빌드 결과 저장
           setBuildResult({
             status: finalStatus,
@@ -583,12 +589,13 @@ export default function App() {
     setBuildStep(null);
     setBuildStepLabels([]);
     setRevertConfirm(null);
+    setUnlockConfirm(null);
     setBuildStatus('Starting Build...');
     try {
       const res = await fetch(`${API_URL}/build`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ platform, config, enginePath, projectPath, gitRevision, cleanBuild, clearCache, cookClean, extraArgs: extraArgs.trim() })
+        body: JSON.stringify({ platform, config, enginePath, projectPath, gitRepoPath, gitRevision, cleanBuild, clearCache, cookClean, extraArgs: extraArgs.trim() })
       });
       if (res.status === 400) {
         const body = await res.json().catch(() => ({}));
@@ -627,6 +634,19 @@ export default function App() {
 
   const handleRevertCancel = async () => {
     setRevertConfirm(null);
+    setIsBuilding(false);
+    setBuildStep(null);
+    setBuildStatus('Canceled');
+    try { await fetch(`${API_URL}/build/cancel`, { method: 'POST' }); } catch {}
+  };
+
+  const handleUnlockConfirm = async () => {
+    setUnlockConfirm(null);
+    try { await fetch(`${API_URL}/build/confirm-unlock`, { method: 'POST' }); } catch {}
+  };
+
+  const handleUnlockCancel = async () => {
+    setUnlockConfirm(null);
     setIsBuilding(false);
     setBuildStep(null);
     setBuildStatus('Canceled');
@@ -924,9 +944,31 @@ export default function App() {
               </div>
 
               <div style={{ marginBottom: '1.5rem', padding: '1.5rem', borderRadius: '12px', background: 'rgba(56,189,248,0.05)', border: '1px solid rgba(56,189,248,0.2)' }}>
-                <h3 style={{ marginBottom: '1.25rem', display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '1.05rem', color: 'var(--primary-color)' }}>
-                  <GitBranch size={18}/> Git Revision Control
-                </h3>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.25rem' }}>
+                  <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '1.05rem', color: 'var(--primary-color)' }}>
+                    <GitBranch size={18}/> Git Revision Control
+                  </h3>
+                  <button 
+                    onClick={async () => {
+                      if (!gitRepoPath.trim()) return alert('Project Git Repository Path를 입력해주세요.');
+                      if (window.confirm('입력된 경로의 .git/index.lock 파일을 강제로 삭제하시겠습니까?')) {
+                        try {
+                          const res = await fetch(`${API_URL}/git/clear-lock`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ gitRepoPath })
+                          });
+                          const data = await res.json();
+                          alert(data.message || data.error);
+                        } catch(e) {
+                          alert('요청 실패');
+                        }
+                      }
+                    }}
+                    style={{ fontSize: '0.75rem', padding: '0.3rem 0.6rem', background: 'rgba(239,68,68,0.1)', color: '#ef4444', border: '1px solid rgba(239,68,68,0.4)', borderRadius: '4px', cursor: 'pointer' }}>
+                    Unlock Git
+                  </button>
+                </div>
                 <div className="form-group" style={{ marginBottom: '1.25rem' }}>
                   <label className="form-label">Project Git Repository Path</label>
                   <input type="text" className="path-input" value={gitRepoPath} onChange={e => setGitRepoPath(e.target.value)} placeholder="e.g. F:\wz\UE_CICD\SampleProject"/>
