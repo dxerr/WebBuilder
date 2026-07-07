@@ -25,6 +25,15 @@ const loadPath = (key: string) => {
 const savePath = (key: string, value: string) => {
   try { localStorage.setItem(key, value); } catch { /* ignore */ }
 };
+// 추가 빌드 파라미터 검증: 따옴표 바깥 공백 기준 토큰화 후, 각 토큰이 '-'로 시작해야 함.
+// 유효하면 null, 아니면 에러 메시지를 반환한다. (백엔드 validateExtraArgs와 동일 규칙)
+const validateExtraArgs = (raw: string): string | null => {
+  const s = (raw || '').trim();
+  if (!s) return null;
+  const tokens = s.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+  const bad = tokens.find(t => !t.startsWith('-'));
+  return bad ? `각 파라미터는 '-'로 시작해야 합니다: "${bad}"` : null;
+};
 const COLORS = ['#38bdf8', '#818cf8', '#34d399', '#f87171'];
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -419,6 +428,7 @@ export default function App() {
   const [cleanBuild, setCleanBuild]   = useState(false);
   const [clearCache, setClearCache]     = useState(false);
   const [cookClean,  setCookClean]      = useState(false);
+  const [extraArgs,  setExtraArgs]      = useState(() => loadPath('ue.extraArgs'));
   const [clearCacheConfirm, setClearCacheConfirm] = useState(false);
   const [isBuilding, setIsBuilding]   = useState(false);
   const [buildStatus, setBuildStatus] = useState('Idle');
@@ -536,6 +546,11 @@ export default function App() {
       setBuildStatus('Set Engine Directory Path and Project Directory Path first');
       return;
     }
+    const extraErr = validateExtraArgs(extraArgs);
+    if (extraErr) {
+      setBuildStatus(`Invalid additional parameters — ${extraErr}`);
+      return;
+    }
     if (clearCache) {
       setClearCacheConfirm(true);
       return;
@@ -573,7 +588,7 @@ export default function App() {
       const res = await fetch(`${API_URL}/build`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ platform, config, enginePath, projectPath, gitRevision, cleanBuild, clearCache, cookClean })
+        body: JSON.stringify({ platform, config, enginePath, projectPath, gitRevision, cleanBuild, clearCache, cookClean, extraArgs: extraArgs.trim() })
       });
       if (res.status === 400) {
         const body = await res.json().catch(() => ({}));
@@ -939,6 +954,27 @@ export default function App() {
               <div className="form-group" style={{ marginBottom: '1.5rem' }}>
                 <label className="form-label">Project Directory Path (.uproject location)</label>
                 <input type="text" className="path-input" value={projectPath} onChange={e => setProjectPath(e.target.value)} placeholder="e.g. F:\wz\UE_CICD\SampleProject"/>
+              </div>
+
+              {/* ── Additional Build Parameters (수동 UAT 인자) ── */}
+              <div className="form-group" style={{ marginBottom: '1.5rem' }}>
+                <label className="form-label">Additional Build Parameters&nbsp;<span style={{ fontWeight: 400, color: 'var(--text-secondary)' }}>(optional)</span></label>
+                <input
+                  type="text"
+                  className="path-input"
+                  value={extraArgs}
+                  onChange={e => { setExtraArgs(e.target.value); savePath('ue.extraArgs', e.target.value); }}
+                  placeholder={'e.g. -prereqs   -compressed   -execcmds="stat fps"'}
+                  style={validateExtraArgs(extraArgs) ? { borderColor: 'rgba(248,113,113,0.7)' } : undefined}
+                />
+                <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '0.4rem' }}>
+                  BuildCookRun 커맨드 끝에 그대로 부착됩니다. 여러 개는 공백으로 구분하고, 각 항목은 <code>-</code>로 시작해야 합니다. 값에 공백이 필요하면 큰따옴표로 감싸세요 (예: <code>-execcmds="stat fps"</code>).
+                </div>
+                {validateExtraArgs(extraArgs) && (
+                  <div style={{ fontSize: '0.8rem', color: '#f87171', marginTop: '0.3rem' }}>
+                    {validateExtraArgs(extraArgs)}
+                  </div>
+                )}
               </div>
 
               {/* ── Build Options ── */}

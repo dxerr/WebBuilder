@@ -174,6 +174,19 @@ db.exec(`
   if (!buildCols.includes('error_count'))   db.exec('ALTER TABLE builds ADD COLUMN error_count INTEGER');
   if (!buildCols.includes('warning_count')) db.exec('ALTER TABLE builds ADD COLUMN warning_count INTEGER');
   if (!buildCols.includes('issue_file'))    db.exec('ALTER TABLE builds ADD COLUMN issue_file TEXT');
+  // extra_args: UI에서 수동 입력한 추가 UAT 파라미터(BuildCookRun 뒤에 그대로 부착)
+  if (!buildCols.includes('extra_args'))     db.exec('ALTER TABLE builds ADD COLUMN extra_args TEXT');
+}
+
+// 추가 빌드 파라미터 검증 유틸: 따옴표 바깥 공백 기준 토큰화 후 각 토큰이 '-'로 시작해야 함.
+// 반환: { ok:true, value } | { ok:false, error }
+function validateExtraArgs(raw) {
+  const s = (raw || '').trim();
+  if (!s) return { ok: true, value: '' };
+  const tokens = s.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+  const bad = tokens.find(t => !t.startsWith('-'));
+  if (bad) return { ok: false, error: `Additional parameters must each start with '-': "${bad}"` };
+  return { ok: true, value: s };
 }
 
 // WebSocket connections
@@ -479,7 +492,7 @@ let pendingBuildContext = null;
 
 // 堉キ貫
 async function executeBuild(ctx) {
-  const { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision, cleanBuild, clearCache, cookClean } = ctx;
+  const { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision, cleanBuild, clearCache, cookClean, extraArgs } = ctx;
 
   // ─── 로그 파일 준비 ────────────────────────────────────────────────────────
   // 저장 경로: <projectRoot>/Saved/Builds/<platform>/<config>/Log/
@@ -629,11 +642,14 @@ async function executeBuild(ctx) {
     // PHASE 2: 빌드 명령줄 조립 및 서브프로세스 런처 진입
     broadcast({ type: 'STEP', ...STEPS.BUILD_START, buildId });
     blogLog('LOG', `[Build] Step ${STEPS.BUILD_START.step}/${STEPS.BUILD_START.total} BAT run (${platform} / ${config})${cleanBuild ? ' [Clean Build]' : ''}${cookClean ? ' [Cook Clean]' : ''}`);
+    if ((extraArgs || '').trim()) blogLog('LOG', `[Build] Extra UAT args: ${extraArgs.trim()}`);
 
     const batEnv        = {
       ...process.env,
       ENGINE_DIR_OVERRIDE:  finalEnginePath,
       PROJECT_DIR_OVERRIDE: finalProjectPath,
+      // UI에서 입력한 추가 UAT 파라미터. bat이 각 BuildCookRun 끝에 그대로 부착한다(미설정 시 빈 문자열=무해).
+      EXTRA_UAT_ARGS:       (extraArgs || '').trim(),
       // Android SDK 등 시스템 환경 변수가 설정되지 않은 경우를 대비한 하드코딩 Fallback 경로
       ANDROID_HOME:         process.env.ANDROID_HOME     || 'C:\\Android\\Sdk',
       ANDROID_SDK_ROOT:     process.env.ANDROID_SDK_ROOT || 'C:\\Android\\Sdk',
@@ -952,9 +968,14 @@ app.post('/api/build', (req, res) => {
     return res.status(400).json({ error: 'A build is already in progress' });
   }
 
-  const { platform, config, enginePath, projectPath, gitRevision, cleanBuild, clearCache, cookClean } = req.body;
+  const { platform, config, enginePath, projectPath, gitRevision, cleanBuild, clearCache, cookClean, extraArgs } = req.body;
   if (!platform || !config) {
     return res.status(400).json({ error: 'Missing platform or config' });
+  }
+  // 추가 빌드 파라미터 검증 (각 토큰은 '-'로 시작해야 함)
+  const extra = validateExtraArgs(extraArgs);
+  if (!extra.ok) {
+    return res.status(400).json({ error: extra.error });
   }
   // Engine/Project 경로는 UI 입력(Engine Directory Path / Project Directory Path)에서 반드시 전달되어야 한다.
   if (!enginePath || !projectPath) {
@@ -977,8 +998,8 @@ app.post('/api/build', (req, res) => {
   // 빌드 상태 스냅샷 초기화 (새 WebSocket 연결 시 즉시 동기화됨)
   resetBuildState(buildId, platform, config);
 
-  db.prepare('INSERT INTO builds (id, platform, config, status, start_time) VALUES (?, ?, ?, ?, ?)')
-    .run(buildId, platform, config, 'Running', startTime.toISOString());
+  db.prepare('INSERT INTO builds (id, platform, config, status, start_time, extra_args) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(buildId, platform, config, 'Running', startTime.toISOString(), extra.value || null);
   res.json({ message: 'Build triggered', buildId });
 
   (async () => {
@@ -986,7 +1007,7 @@ app.post('/api/build', (req, res) => {
       // UI에서 전달된 경로를 그대로 사용 (핸들러 진입부에서 존재 검증됨)
       const finalEnginePath  = enginePath;
       const finalProjectPath = projectPath;
-      const ctx = { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision, cleanBuild, clearCache, cookClean };
+      const ctx = { buildId, startTime, platform, config, finalEnginePath, finalProjectPath, gitRevision, cleanBuild, clearCache, cookClean, extraArgs: extra.value };
 
       // Sentry 사전 판정 (Git Check 스텝 total 표시에 필요)
       const _sentryProps = parseSentryProperties(finalProjectPath);

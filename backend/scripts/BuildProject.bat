@@ -78,10 +78,10 @@ if /i "%TARGET_PLATFORM%"=="Win64Server" (
             -utf8output ^
             -server -serverplatform=Win64 -noclient ^
             -nocompileeditor -skipbuildeditor -nocompile ^
-            -cook -stage -archive ^
+            -cook -stage -archive -pak -iostore ^
             -clearcookeddata ^
             -UBA ^
-            -archivedirectory="%ARCHIVE_DIR%\Win64Server\%TARGET_CONFIG%"
+            -archivedirectory="%ARCHIVE_DIR%\Win64Server\%TARGET_CONFIG%" %EXTRA_UAT_ARGS%
     ) else (
         call "%UAT_BAT%" BuildCookRun ^
             -project="%PROJECT_FILE%" ^
@@ -89,9 +89,9 @@ if /i "%TARGET_PLATFORM%"=="Win64Server" (
             -serverconfig="%TARGET_CONFIG%" ^
             -utf8output ^
             -server -serverplatform=Win64 -noclient ^
-            -build -cook -stage -archive ^
+            -build -cook -stage -archive -pak -iostore ^
             -UBA %CLEAN_FLAG% ^
-            -archivedirectory="%ARCHIVE_DIR%\Win64Server\%TARGET_CONFIG%"
+            -archivedirectory="%ARCHIVE_DIR%\Win64Server\%TARGET_CONFIG%" %EXTRA_UAT_ARGS%
     )
 
     if !ERRORLEVEL! NEQ 0 (
@@ -121,10 +121,10 @@ if not "%COOK_CLEAN_FLAG%"=="" (
         -utf8output ^
         -platform="%TARGET_PLATFORM%" ^
         -nocompileeditor -skipbuildeditor -nocompile ^
-        -cook -stage -package -archive ^
+        -cook -stage -package -archive -pak -iostore ^
         -clearcookeddata ^
         -UBA ^
-        -archivedirectory="%ARCHIVE_DIR%\%TARGET_PLATFORM%\%TARGET_CONFIG%"
+        -archivedirectory="%ARCHIVE_DIR%\%TARGET_PLATFORM%\%TARGET_CONFIG%" %EXTRA_UAT_ARGS%
 ) else (
     call "%UAT_BAT%" BuildCookRun ^
         -project="%PROJECT_FILE%" ^
@@ -133,9 +133,9 @@ if not "%COOK_CLEAN_FLAG%"=="" (
         -serverconfig="%TARGET_CONFIG%" ^
         -utf8output ^
         -platform="%TARGET_PLATFORM%" ^
-        -build -cook -stage -package -archive ^
+        -build -cook -stage -package -archive -pak -iostore ^
         -UBA %CLEAN_FLAG% ^
-        -archivedirectory="%ARCHIVE_DIR%\%TARGET_PLATFORM%\%TARGET_CONFIG%"
+        -archivedirectory="%ARCHIVE_DIR%\%TARGET_PLATFORM%\%TARGET_CONFIG%" %EXTRA_UAT_ARGS%
 )
 
 if %ERRORLEVEL% NEQ 0 (
